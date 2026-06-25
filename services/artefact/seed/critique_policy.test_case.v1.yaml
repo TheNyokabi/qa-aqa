@@ -1,0 +1,22 @@
+name: test_case_rubric_v1
+target_type: test_case
+description: |
+  Critic rubric for test_case artefacts. Evaluated only when requirement.criticality
+  >= medium. The LLM critic (chat-prod) evaluates against `llm_checks`; OPA
+  enforces `deterministic_checks` regardless of LLM availability.
+deterministic_checks:
+  - id: has_traceability
+    rego_rule: input.payload.traceability_to_requirement != null
+  - id: has_steps
+    rego_rule: count(input.payload.steps) > 0
+  - id: steps_have_keyword
+    rego_rule: every step in input.payload.steps { step.keyword != null }
+  - id: has_expected_result
+    rego_rule: input.payload.expected_result != null
+llm_checks:
+  - id: covers_negative_path
+    prompt: "Does the test case cover at least one negative path (invalid input, error condition, or failure mode)? Answer yes/no with one-sentence justification."
+  - id: covers_boundary_values
+    prompt: "If the requirement involves numeric ranges, dates, or string lengths, does the test case probe boundary values? If the requirement has no such ranges, answer 'n/a'."
+  - id: deterministic_steps
+    prompt: "Are the steps phrased so two engineers would execute them identically (no ambiguous verbs like 'check', 'verify', 'try')? Answer yes/no with one-sentence justification."

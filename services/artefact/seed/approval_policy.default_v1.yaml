@@ -1,0 +1,10 @@
+name: default_v1
+applies_to: [requirement, test_case, approval_policy, critique_policy]
+states: [draft, in_review, approved, archived]
+transitions:
+  "draft -> in_review":    { roles_any: [agent, user] }
+  "draft -> archived":     { roles_any: [user] }
+  "in_review -> approved": { roles_any: [user] }
+  "in_review -> draft":    { roles_any: [user] }
+  "in_review -> archived": { roles_any: [user] }
+  "approved -> archived":  { roles_any: [user] }

@@ -42,6 +42,8 @@ readonly IMG_OPA="docker.io/openpolicyagent/opa:1.17.1"
 # Sub-project C2 — locally built images
 readonly IMG_RAG="qa-aqa/rag-service:dev"
 readonly IMG_POLICY="qa-aqa/policy-svc:dev"
+# Sub-project D0.5
+readonly IMG_ARTEFACT="qa-aqa/artefact-service:dev"
 
 # Models to pre-pull on Ollama after startup (idempotent — skips if present)
 readonly OLLAMA_PRELOAD_MODELS=("nomic-embed-text" "llama3.2:3b")
@@ -74,6 +76,8 @@ readonly PORT_OPA=8181
 # Sub-project C2
 readonly PORT_RAG=8001
 readonly PORT_POLICY=8002
+# Sub-project D0.5
+readonly PORT_ARTEFACT=8003
 
 # Brew packages required on the host
 readonly BREW_PKGS=("podman" "podman-compose" "jq")
@@ -648,6 +652,28 @@ services:
       interval: 10s
       timeout: 5s
       retries: 20
+
+  # ─── Sub-project D0.5 ─────────────────────────────────────────────────────
+  artefact-service:
+    image: ${IMG_ARTEFACT}
+    container_name: artefact-service
+    environment:
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGUSER=\${POSTGRES_USER}
+      - PGPASSWORD=\${POSTGRES_PASSWORD}
+      - PGDATABASE=\${POSTGRES_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${PORT_ARTEFACT}:8003"
+    networks: [${NETWORK_NAME}]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8003/health').read()\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
 EOF
     ok "wrote compose.yaml"
 }
@@ -711,9 +737,9 @@ compose() {
 }
 
 build_custom_images() {
-    step "5a/8  Build custom images (rag-service, policy-svc)"
-    local services=("rag" "policy")
-    local images=("${IMG_RAG}" "${IMG_POLICY}")
+    step "5a/8  Build custom images (rag-service, policy-svc, artefact-service)"
+    local services=("rag" "policy" "artefact")
+    local images=("${IMG_RAG}" "${IMG_POLICY}" "${IMG_ARTEFACT}")
     for i in "${!services[@]}"; do
         local svc="${services[$i]}"
         local img="${images[$i]}"
@@ -768,7 +794,7 @@ nuke() {
 
 wait_healthy() {
     step "6/8  Wait for services healthy"
-    local services=(postgres opensearch neo4j valkey prometheus grafana loki otel-collector temporal temporal-ui ollama model-gateway opa rag-service policy-svc)
+    local services=(postgres opensearch neo4j valkey prometheus grafana loki otel-collector temporal temporal-ui ollama model-gateway opa rag-service policy-svc artefact-service)
     local max_wait=300
     local elapsed=0
     while (( elapsed < max_wait )); do
@@ -791,6 +817,73 @@ wait_healthy() {
     err "timed out waiting for services after ${max_wait}s"
     podman ps --format "table {{.Names}}\t{{.Status}}"
     return 1
+}
+
+smoke_artefact_d05_suite() {
+    # Multi-step suite covering: create, idempotency, bulk, PATCH versioning,
+    # disallowed transition (409), allowed transition (history captures policy).
+    # Returns 0 on success, non-zero on first failure.
+    local base="http://localhost:${PORT_ARTEFACT}"
+    local hdr_tenant='-H X-Tenant-ID:default'
+    local hdr_json='-H Content-Type:application/json'
+    local actor='urn:qa-aqa:user:smoke'
+    local stamp="$(date +%s)-$$"
+
+    # 1) create requirement
+    local body
+    body=$(curl -fs ${hdr_tenant} ${hdr_json} -H "Idempotency-Key: smoke-${stamp}" \
+        -X POST "${base}/artefacts" \
+        -d "{\"type\":\"requirement\",\"payload\":{\"title\":\"smoke\"},\"actor\":\"${actor}\"}") || return 1
+    local aid
+    aid=$(echo "${body}" | jq -r '.id')
+    [[ -n "${aid}" && "${aid}" != "null" ]] || return 2
+
+    # 2) same idempotency key → returns same id, no new row
+    local body2
+    body2=$(curl -fs ${hdr_tenant} ${hdr_json} -H "Idempotency-Key: smoke-${stamp}" \
+        -X POST "${base}/artefacts" \
+        -d "{\"type\":\"requirement\",\"payload\":{\"title\":\"smoke2\"},\"actor\":\"${actor}\"}") || return 3
+    local aid2; aid2=$(echo "${body2}" | jq -r '.id')
+    [[ "${aid}" == "${aid2}" ]] || return 4
+    # Payload must be unchanged (the original)
+    local title; title=$(echo "${body2}" | jq -r '.payload.title')
+    [[ "${title}" == "smoke" ]] || return 5
+
+    # 3) bulk create 3 items
+    local bulk_body
+    bulk_body=$(curl -fs ${hdr_tenant} ${hdr_json} -X POST "${base}/artefacts/bulk" \
+        -d "{\"items\":[
+            {\"type\":\"requirement\",\"payload\":{\"i\":1},\"actor\":\"${actor}\"},
+            {\"type\":\"requirement\",\"payload\":{\"i\":2},\"actor\":\"${actor}\"},
+            {\"type\":\"requirement\",\"payload\":{\"i\":3},\"actor\":\"${actor}\"}
+        ]}") || return 6
+    [[ $(echo "${bulk_body}" | jq 'length') == 3 ]] || return 7
+
+    # 4) PATCH bumps version, writes history row
+    curl -fs ${hdr_tenant} ${hdr_json} -X PATCH "${base}/artefacts/${aid}" \
+        -d "{\"payload\":{\"title\":\"smoke patched\"},\"actor\":\"${actor}\"}" >/dev/null || return 8
+    local version; version=$(curl -fs ${hdr_tenant} "${base}/artefacts/${aid}" | jq -r '.version')
+    [[ "${version}" == "2" ]] || return 9
+    local hist_count
+    hist_count=$(curl -fs ${hdr_tenant} "${base}/artefacts/${aid}/history" | jq 'length')
+    [[ "${hist_count}" == "1" ]] || return 10
+
+    # 5) disallowed transition (draft→approved skips in_review) returns 409
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' ${hdr_tenant} ${hdr_json} \
+        -X POST "${base}/artefacts/${aid}/transition" \
+        -d "{\"to_state\":\"approved\",\"actor\":\"${actor}\"}")
+    [[ "${code}" == "409" ]] || return 11
+
+    # 6) allowed transition draft→in_review records policy_version in history
+    curl -fs ${hdr_tenant} ${hdr_json} -X POST "${base}/artefacts/${aid}/transition" \
+        -d "{\"to_state\":\"in_review\",\"actor\":\"${actor}\"}" >/dev/null || return 12
+    local pol
+    pol=$(curl -fs ${hdr_tenant} "${base}/artefacts/${aid}/history" \
+        | jq -r '[.[] | select(.policy_version != null)] | last.policy_version')
+    [[ "${pol}" == "default_v1" ]] || return 13
+
+    return 0
 }
 
 smoke_tests() {
@@ -818,6 +911,12 @@ smoke_tests() {
         "policy-svc-health|curl -fs http://localhost:${PORT_POLICY}/health | jq -e '.status==\"ok\"' >/dev/null"
         "policy-svc-allow-admin|curl -fs -X POST http://localhost:${PORT_POLICY}/authorize -H 'Content-Type: application/json' -d '{\"subject\":{\"role\":\"admin\"},\"action\":\"delete\",\"resource\":{\"id\":\"x\"}}' | jq -e '.allow==true' >/dev/null"
         "policy-svc-deny-default|curl -fs -X POST http://localhost:${PORT_POLICY}/authorize -H 'Content-Type: application/json' -d '{\"subject\":{\"role\":\"viewer\"},\"action\":\"delete\",\"resource\":{\"visibility\":\"private\"}}' | jq -e '.allow==false' >/dev/null"
+        "artefact-health|curl -fs http://localhost:${PORT_ARTEFACT}/health | jq -e '.status==\"ok\"' >/dev/null"
+        "artefact-rls-gate|[ \$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:${PORT_ARTEFACT}/artefacts -H 'Content-Type: application/json' -d '{\"type\":\"requirement\",\"payload\":{},\"actor\":\"urn:qa-aqa:user:smoke\"}') = '400' ]"
+        "artefact-urn-422|[ \$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:${PORT_ARTEFACT}/artefacts -H 'Content-Type: application/json' -H 'X-Tenant-ID: default' -d '{\"type\":\"requirement\",\"payload\":{},\"actor\":\"alice\"}') = '422' ]"
+        "artefact-seed-loaded|curl -fs -H 'X-Tenant-ID: default' 'http://localhost:${PORT_ARTEFACT}/artefacts?type=approval_policy' | jq -e 'length >= 1' >/dev/null"
+        "artefact-default-policy-fallback|curl -fs -H 'X-Tenant-ID: default' 'http://localhost:${PORT_ARTEFACT}/policies/approval/test_case' | jq -e '.name==\"default_v1\"' >/dev/null"
+        "artefact-d05-suite|smoke_artefact_d05_suite"
     )
     for t in "${tests[@]}"; do
         local name="${t%%|*}"
@@ -848,6 +947,7 @@ smoke_tests() {
         echo "  OPA           http://localhost:${PORT_OPA}/health"
         echo "  rag-service   http://localhost:${PORT_RAG}     POST /ingest, /search"
         echo "  policy-svc    http://localhost:${PORT_POLICY}     POST /authorize"
+        echo "  artefact-svc  http://localhost:${PORT_ARTEFACT}     POST /artefacts (X-Tenant-ID required)"
         return 0
     else
         err "${failures} smoke test(s) failed"

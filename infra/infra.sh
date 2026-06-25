@@ -35,11 +35,18 @@ readonly IMG_OTEL="docker.io/otel/opentelemetry-collector-contrib:0.96.0"
 readonly IMG_PROMETHEUS="docker.io/prom/prometheus:v2.51.0"
 readonly IMG_GRAFANA="docker.io/grafana/grafana-oss:10.4.0"
 readonly IMG_LOKI="docker.io/grafana/loki:3.0.0"
+# Sub-project C1
+readonly IMG_OLLAMA="docker.io/ollama/ollama:0.3.14"
+readonly IMG_LITELLM="ghcr.io/berriai/litellm:main-stable"
+readonly IMG_OPA="docker.io/openpolicyagent/opa:1.17.1"
+
+# Models to pre-pull on Ollama after startup (idempotent — skips if present)
+readonly OLLAMA_PRELOAD_MODELS=("nomic-embed-text" "llama3.2:3b")
 
 # Podman machine sizing
 readonly MACHINE_NAME="podman-machine-default"
 readonly MACHINE_CPUS=6
-readonly MACHINE_MEMORY=12288   # MB
+readonly MACHINE_MEMORY=20480   # MB — bumped from 12288 for Sub-project C (Ollama needs ~6 GB)
 readonly MACHINE_DISK=100       # GB
 
 # Ports on the host (must be free)
@@ -57,6 +64,10 @@ readonly PORT_OTEL_HEALTH=13133
 readonly PORT_PROMETHEUS=9090
 readonly PORT_GRAFANA=3000
 readonly PORT_LOKI=3100
+# Sub-project C1
+readonly PORT_OLLAMA=11434
+readonly PORT_LITELLM=4000
+readonly PORT_OPA=8181
 
 # Brew packages required on the host
 readonly BREW_PKGS=("podman" "podman-compose" "jq")
@@ -67,6 +78,9 @@ readonly DEFAULT_POSTGRES_PASSWORD="appdevpw"
 readonly DEFAULT_POSTGRES_DB="app"
 readonly DEFAULT_NEO4J_PASSWORD="neo4jdevpw"
 readonly DEFAULT_GRAFANA_ADMIN_PASSWORD="admin"
+# Cloud API keys default to empty — fill in your .env to enable cloud aliases
+readonly DEFAULT_ANTHROPIC_API_KEY=""
+readonly DEFAULT_OPENAI_API_KEY=""
 
 # =============================================================================
 # SECTION 2 — Log helpers
@@ -128,6 +142,19 @@ ensure_podman_machine() {
     else
         ok "machine: ${MACHINE_NAME} exists"
     fi
+
+    # Resize RAM if it doesn't match target (e.g. after a sub-project bumps it).
+    # Resources.Memory is reported in MB by podman.
+    local current_mem_mb
+    current_mem_mb=$(podman machine inspect "${MACHINE_NAME}" 2>/dev/null | jq -r '.[0].Resources.Memory // 0')
+    if [[ -n "${current_mem_mb}" && "${current_mem_mb}" != "0" && "${current_mem_mb}" != "${MACHINE_MEMORY}" ]]; then
+        warn "machine memory ${current_mem_mb} MB != target ${MACHINE_MEMORY} MB — resizing (containers will need to be restarted via 'compose up' after)"
+        run_or_print "podman machine stop '${MACHINE_NAME}' || true"
+        run_or_print "podman machine set --memory ${MACHINE_MEMORY} '${MACHINE_NAME}'"
+    elif [[ "${current_mem_mb}" == "${MACHINE_MEMORY}" ]]; then
+        ok "machine memory: ${current_mem_mb} MB (target)"
+    fi
+
     local running
     running=$(podman machine list --format json 2>/dev/null | jq -r ".[] | select(.Name==\"${MACHINE_NAME}\") | .Running" || echo "false")
     if [[ "${running}" != "true" ]]; then
@@ -144,7 +171,14 @@ ensure_podman_machine() {
 
 write_dist_dir() {
     step "3/8  Generate configs in ${DIST_DIR}"
-    mkdir -p "${DIST_DIR}/postgres-init" "${DIST_DIR}/otel" "${DIST_DIR}/prometheus" "${DIST_DIR}/grafana/provisioning/datasources" "${DIST_DIR}/loki"
+    mkdir -p \
+        "${DIST_DIR}/postgres-init" \
+        "${DIST_DIR}/otel" \
+        "${DIST_DIR}/prometheus" \
+        "${DIST_DIR}/grafana/provisioning/datasources" \
+        "${DIST_DIR}/loki" \
+        "${DIST_DIR}/litellm" \
+        "${DIST_DIR}/opa/policies/qa_aqa"
 
     cat >"${DIST_DIR}/postgres-init/01-temporal.sql" <<'EOF'
 -- Create temporal user + databases for the temporal auto-setup container
@@ -263,6 +297,52 @@ ruler:
 EOF
     ok "wrote loki/config.yaml"
 
+    cat >"${DIST_DIR}/litellm/config.yaml" <<EOF
+# Aliases hide the backend from callers. Switch dev↔prod by changing alias mapping.
+model_list:
+  - model_name: chat-dev
+    litellm_params:
+      model: ollama_chat/llama3.2:3b
+      api_base: http://ollama:${PORT_OLLAMA}
+
+  - model_name: chat-prod
+    litellm_params:
+      model: anthropic/claude-opus-4-7
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: embed-dev
+    litellm_params:
+      model: ollama/nomic-embed-text
+      api_base: http://ollama:${PORT_OLLAMA}
+
+  - model_name: embed-prod
+    litellm_params:
+      model: openai/text-embedding-3-small
+      api_key: os.environ/OPENAI_API_KEY
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+EOF
+    ok "wrote litellm/config.yaml"
+
+    cat >"${DIST_DIR}/opa/policies/qa_aqa/authz.rego" <<'EOF'
+package qa_aqa.authz
+
+default allow := false
+
+# Admins can do anything
+allow if {
+    input.subject.role == "admin"
+}
+
+# Anyone can read public resources
+allow if {
+    input.action == "read"
+    input.resource.visibility == "public"
+}
+EOF
+    ok "wrote opa/policies/qa_aqa/authz.rego"
+
     write_compose_yaml
 }
 
@@ -283,6 +363,7 @@ volumes:
   prom-data:
   grafana-data:
   loki-data:
+  ollama-data:
 
 services:
   postgres:
@@ -465,6 +546,54 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+
+  # ─── Sub-project C1 ───────────────────────────────────────────────────────
+  ollama:
+    image: ${IMG_OLLAMA}
+    container_name: ollama
+    volumes:
+      - ollama-data:/root/.ollama
+    ports:
+      - "${PORT_OLLAMA}:11434"
+    networks: [${NETWORK_NAME}]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  model-gateway:
+    image: ${IMG_LITELLM}
+    container_name: model-gateway
+    command: ["--config", "/app/config.yaml", "--port", "${PORT_LITELLM}"]
+    environment:
+      - LITELLM_MASTER_KEY=\${LITELLM_MASTER_KEY}
+      - ANTHROPIC_API_KEY=\${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=\${OPENAI_API_KEY:-}
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:Z
+    ports:
+      - "${PORT_LITELLM}:${PORT_LITELLM}"
+    depends_on:
+      - ollama
+    networks: [${NETWORK_NAME}]
+    # LiteLLM image is distroless (no wget/curl/sh); smoke test verifies /health/liveliness from host
+
+  opa:
+    image: ${IMG_OPA}
+    container_name: opa
+    command:
+      - run
+      - --server
+      - --addr=0.0.0.0:${PORT_OPA}
+      - --log-level=info
+      - /policies
+    volumes:
+      - ./opa/policies:/policies:Z
+    ports:
+      - "${PORT_OPA}:${PORT_OPA}"
+    networks: [${NETWORK_NAME}]
+    # OPA's distroless image has no shell — rely on host-side smoke test
 EOF
     ok "wrote compose.yaml"
 }
@@ -475,21 +604,48 @@ EOF
 
 ensure_env_file() {
     step "4/8  Secrets (${ENV_FILE})"
-    if [[ -f "${ENV_FILE}" ]]; then
-        ok ".env already exists, preserving"
-        return
-    fi
-    cat >"${ENV_FILE}" <<EOF
+    if [[ ! -f "${ENV_FILE}" ]]; then
+        local litellm_master_key
+        litellm_master_key="sk-$(openssl rand -hex 24)"
+        cat >"${ENV_FILE}" <<EOF
 # QA/AQA infra secrets — generated by infra.sh
-# Edit if you want; this file is not regenerated.
+# Edit if you want; missing keys are appended on rerun, existing keys preserved.
 POSTGRES_USER=${DEFAULT_POSTGRES_USER}
 POSTGRES_PASSWORD=${DEFAULT_POSTGRES_PASSWORD}
 POSTGRES_DB=${DEFAULT_POSTGRES_DB}
 NEO4J_PASSWORD=${DEFAULT_NEO4J_PASSWORD}
 GRAFANA_ADMIN_PASSWORD=${DEFAULT_GRAFANA_ADMIN_PASSWORD}
+LITELLM_MASTER_KEY=${litellm_master_key}
+ANTHROPIC_API_KEY=${DEFAULT_ANTHROPIC_API_KEY}
+OPENAI_API_KEY=${DEFAULT_OPENAI_API_KEY}
 EOF
-    chmod 600 "${ENV_FILE}"
-    ok ".env created with defaults"
+        chmod 600 "${ENV_FILE}"
+        ok ".env created with defaults"
+        return
+    fi
+    # File exists — append any missing keys without disturbing existing ones
+    local appended=0
+    _append_if_missing() {
+        local key="$1" val="$2"
+        if ! grep -qE "^${key}=" "${ENV_FILE}"; then
+            printf '%s=%s\n' "${key}" "${val}" >>"${ENV_FILE}"
+            log "appended ${key} to .env"
+            appended=$((appended+1))
+        fi
+    }
+    _append_if_missing POSTGRES_USER "${DEFAULT_POSTGRES_USER}"
+    _append_if_missing POSTGRES_PASSWORD "${DEFAULT_POSTGRES_PASSWORD}"
+    _append_if_missing POSTGRES_DB "${DEFAULT_POSTGRES_DB}"
+    _append_if_missing NEO4J_PASSWORD "${DEFAULT_NEO4J_PASSWORD}"
+    _append_if_missing GRAFANA_ADMIN_PASSWORD "${DEFAULT_GRAFANA_ADMIN_PASSWORD}"
+    _append_if_missing LITELLM_MASTER_KEY "sk-$(openssl rand -hex 24)"
+    _append_if_missing ANTHROPIC_API_KEY "${DEFAULT_ANTHROPIC_API_KEY}"
+    _append_if_missing OPENAI_API_KEY "${DEFAULT_OPENAI_API_KEY}"
+    if (( appended == 0 )); then
+        ok ".env already complete"
+    else
+        ok ".env: appended ${appended} missing key(s)"
+    fi
 }
 
 # =============================================================================
@@ -503,6 +659,22 @@ compose() {
 bring_up() {
     step "5/8  Pull images + start stack"
     run_or_print "(cd '${DIST_DIR}' && podman-compose --env-file '${ENV_FILE}' -f compose.yaml up -d)"
+}
+
+ollama_preload() {
+    step "5b/8  Pre-pull Ollama models (idempotent)"
+    if ! podman exec ollama ollama list >/dev/null 2>&1; then
+        warn "ollama container not responsive yet, sleeping 5s"
+        sleep 5
+    fi
+    for model in "${OLLAMA_PRELOAD_MODELS[@]}"; do
+        if podman exec ollama ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qE "^${model}(:|$)"; then
+            ok "ollama: ${model} already present"
+        else
+            log "ollama pull ${model} (this can take minutes for the first model)"
+            run_or_print "podman exec ollama ollama pull '${model}'"
+        fi
+    done
 }
 
 bring_down() {
@@ -525,7 +697,7 @@ nuke() {
 
 wait_healthy() {
     step "6/8  Wait for services healthy"
-    local services=(postgres opensearch neo4j valkey prometheus grafana loki otel-collector temporal temporal-ui)
+    local services=(postgres opensearch neo4j valkey prometheus grafana loki otel-collector temporal temporal-ui ollama model-gateway opa)
     local max_wait=300
     local elapsed=0
     while (( elapsed < max_wait )); do
@@ -565,6 +737,10 @@ smoke_tests() {
         "grafana|curl -fs http://localhost:${PORT_GRAFANA}/api/health | jq -e '.database==\"ok\"' >/dev/null"
         "loki|curl -fs http://localhost:${PORT_LOKI}/ready"
         "otel-collector|curl -fs http://localhost:${PORT_OTEL_HEALTH}/ >/dev/null"
+        "ollama|curl -fs http://localhost:${PORT_OLLAMA}/api/version | jq -e '.version' >/dev/null"
+        "model-gateway-liveness|curl -fs http://localhost:${PORT_LITELLM}/health/liveliness >/dev/null"
+        "model-gateway-embedding|curl -fs -X POST http://localhost:${PORT_LITELLM}/v1/embeddings -H 'Authorization: Bearer ${LITELLM_MASTER_KEY}' -H 'Content-Type: application/json' -d '{\"model\":\"embed-dev\",\"input\":\"hello\"}' | jq -e '.data[0].embedding | length == 768' >/dev/null"
+        "opa|curl -fs http://localhost:${PORT_OPA}/health >/dev/null"
     )
     for t in "${tests[@]}"; do
         local name="${t%%|*}"
@@ -590,6 +766,9 @@ smoke_tests() {
         echo "  Postgres      localhost:${PORT_POSTGRES}             ${POSTGRES_USER} / ${POSTGRES_PASSWORD}"
         echo "  Valkey        localhost:${PORT_VALKEY}"
         echo "  OTel OTLP     localhost:${PORT_OTEL_GRPC} (gRPC) / ${PORT_OTEL_HTTP} (HTTP)"
+        echo "  Ollama        http://localhost:${PORT_OLLAMA}"
+        echo "  model-gateway http://localhost:${PORT_LITELLM}     Bearer \${LITELLM_MASTER_KEY}"
+        echo "  OPA           http://localhost:${PORT_OPA}/health"
         return 0
     else
         err "${failures} smoke test(s) failed"
@@ -627,6 +806,7 @@ case "${cmd}" in
         ensure_env_file
         bring_up
         wait_healthy
+        ollama_preload
         smoke_tests
         ;;
     down)

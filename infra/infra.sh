@@ -21,8 +21,11 @@ set -euo pipefail
 readonly STACK_NAME="qa-aqa"
 readonly NETWORK_NAME="qa-aqa"
 readonly INFRA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPO_ROOT="$(cd "${INFRA_DIR}/.." && pwd)"
 readonly DIST_DIR="${INFRA_DIR}/dist"
 readonly ENV_FILE="${INFRA_DIR}/.env"
+# Used inside compose.yaml heredoc; expands to host path of repo root for bind mounts.
+readonly INFRA_ROOT_FOR_COMPOSE="${REPO_ROOT}"
 
 # Image versions (single place to bump)
 readonly IMG_POSTGRES="docker.io/pgvector/pgvector:pg16"
@@ -44,6 +47,8 @@ readonly IMG_RAG="qa-aqa/rag-service:dev"
 readonly IMG_POLICY="qa-aqa/policy-svc:dev"
 # Sub-project D0.5
 readonly IMG_ARTEFACT="qa-aqa/artefact-service:dev"
+# Sub-project D1
+readonly IMG_AGENT_WORKERS="qa-aqa/agent-workers:dev"
 
 # Models to pre-pull on Ollama after startup (idempotent — skips if present)
 readonly OLLAMA_PRELOAD_MODELS=("nomic-embed-text" "llama3.2:3b")
@@ -674,6 +679,34 @@ services:
       interval: 10s
       timeout: 5s
       retries: 20
+
+  # ─── Sub-project D1 ───────────────────────────────────────────────────────
+  agent-workers:
+    image: ${IMG_AGENT_WORKERS}
+    container_name: agent-workers
+    environment:
+      - TEMPORAL_HOST=temporal:7233
+      - TEMPORAL_TASK_QUEUE=test-design
+      - ARTEFACT_URL=http://artefact-service:8003
+      - RAG_URL=http://rag-service:8001
+      - POLICY_URL=http://policy-svc:8002
+      - MODEL_GATEWAY_URL=http://model-gateway:4000
+      - LITELLM_MASTER_KEY=\${LITELLM_MASTER_KEY}
+      - ANTHROPIC_API_KEY=\${ANTHROPIC_API_KEY:-}
+      - DOCS_SOURCE=/specs
+    depends_on:
+      temporal:
+        condition: service_healthy
+      artefact-service:
+        condition: service_healthy
+      rag-service:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ${INFRA_ROOT_FOR_COMPOSE}/docs/superpowers/specs:/specs:ro
+    networks: [${NETWORK_NAME}]
+    # No HTTP -> no container healthcheck. Smoke verifies via temporal CLI calls.
 EOF
     ok "wrote compose.yaml"
 }
@@ -737,9 +770,9 @@ compose() {
 }
 
 build_custom_images() {
-    step "5a/8  Build custom images (rag-service, policy-svc, artefact-service)"
-    local services=("rag" "policy" "artefact")
-    local images=("${IMG_RAG}" "${IMG_POLICY}" "${IMG_ARTEFACT}")
+    step "5a/8  Build custom images (rag, policy, artefact, agent-workers)"
+    local services=("rag" "policy" "artefact" "agent-workers")
+    local images=("${IMG_RAG}" "${IMG_POLICY}" "${IMG_ARTEFACT}" "${IMG_AGENT_WORKERS}")
     for i in "${!services[@]}"; do
         local svc="${services[$i]}"
         local img="${images[$i]}"
@@ -794,7 +827,7 @@ nuke() {
 
 wait_healthy() {
     step "6/8  Wait for services healthy"
-    local services=(postgres opensearch neo4j valkey prometheus grafana loki otel-collector temporal temporal-ui ollama model-gateway opa rag-service policy-svc artefact-service)
+    local services=(postgres opensearch neo4j valkey prometheus grafana loki otel-collector temporal temporal-ui ollama model-gateway opa rag-service policy-svc artefact-service agent-workers)
     local max_wait=300
     local elapsed=0
     while (( elapsed < max_wait )); do
@@ -886,6 +919,48 @@ smoke_artefact_d05_suite() {
     return 0
 }
 
+_wait_for_log() {
+    # Poll a container's logs for a regex, up to max_wait seconds. Returns 0 on match.
+    local container="$1" pattern="$2" max_wait="${3:-120}"
+    local elapsed=0
+    while (( elapsed < max_wait )); do
+        if podman logs --tail 500 "${container}" 2>&1 | grep -qE "${pattern}"; then
+            return 0
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+    done
+    return 1
+}
+
+smoke_agent_workers_d1_suite() {
+    # End-to-end D1 wiring test:
+    #   - wait for the worker to be ready (Temporal connect + seed)
+    #   - start a design-tests workflow via start_workflow.py (synchronous --wait)
+    #   - assert the result contains test_case_ids
+    #   - assert artefact-service has the test_case artefacts
+    _wait_for_log agent-workers 'Worker started.*test-design' 180 || return 11
+    local input='{"id":"R-smoke-001","title":"login happy and fail","acceptance_criteria":["valid creds return 200","invalid creds return 401"],"criticality":"low","tags":["auth"]}'
+    local out
+    out=$(podman exec agent-workers python -m src.start_workflow design-tests "${input}" default --wait 2>&1) || return 1
+    # The CLI prints two lines: {"workflow_id":"..."} then {"workflow_id":"...","result":{...}}
+    local result_line
+    result_line=$(echo "${out}" | grep -E '"result"' | tail -1)
+    [[ -n "${result_line}" ]] || return 2
+    local test_case_count
+    test_case_count=$(echo "${result_line}" | jq '.result.test_case_ids | length')
+    [[ "${test_case_count}" =~ ^[0-9]+$ ]] && (( test_case_count >= 1 )) || return 3
+    local wf_id
+    wf_id=$(echo "${result_line}" | jq -r '.workflow_id')
+    # Verify artefact-service sees the test_case rows
+    local artefact_count
+    artefact_count=$(curl -fs -H 'X-Tenant-ID: default' \
+        "http://localhost:${PORT_ARTEFACT}/artefacts?type=test_case&workflow_id=${wf_id}" \
+        | jq 'length')
+    (( artefact_count == test_case_count )) || return 4
+    return 0
+}
+
 smoke_tests() {
     step "7/8  Smoke tests"
     # shellcheck disable=SC1091
@@ -917,6 +992,9 @@ smoke_tests() {
         "artefact-seed-loaded|curl -fs -H 'X-Tenant-ID: default' 'http://localhost:${PORT_ARTEFACT}/artefacts?type=approval_policy' | jq -e 'length >= 1' >/dev/null"
         "artefact-default-policy-fallback|curl -fs -H 'X-Tenant-ID: default' 'http://localhost:${PORT_ARTEFACT}/policies/approval/test_case' | jq -e '.name==\"default_v1\"' >/dev/null"
         "artefact-d05-suite|smoke_artefact_d05_suite"
+        "agent-workers-booted|_wait_for_log agent-workers 'Worker started.*test-design' 180"
+        "agent-workers-seed-ran|_wait_for_log agent-workers 'Seed: [0-9]+ spec docs ingested' 180"
+        "agent-workers-d1-suite|smoke_agent_workers_d1_suite"
     )
     for t in "${tests[@]}"; do
         local name="${t%%|*}"

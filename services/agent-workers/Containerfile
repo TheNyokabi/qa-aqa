@@ -1,0 +1,25 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY pyproject.toml /app/
+RUN pip install --no-cache-dir \
+    "temporalio==1.7.1" \
+    "langgraph==0.2.50" \
+    "langchain-core==0.3.15" \
+    "httpx==0.27.2" \
+    "pydantic==2.9.2" \
+    "pyyaml==6.0.2"
+
+COPY src /app/src
+
+ENV TEMPORAL_HOST=temporal:7233 \
+    TEMPORAL_TASK_QUEUE=test-design \
+    ARTEFACT_URL=http://artefact-service:8003 \
+    RAG_URL=http://rag-service:8001 \
+    POLICY_URL=http://policy-svc:8002 \
+    MODEL_GATEWAY_URL=http://model-gateway:4000 \
+    DOCS_SOURCE=/specs
+
+# Spec docs mount-in is configured in compose; provide a no-op default if absent.
+CMD ["python", "-u", "-m", "src.worker"]

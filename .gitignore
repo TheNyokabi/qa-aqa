@@ -1,0 +1,17 @@
+# Generated artifacts
+infra/dist/
+
+# Secrets
+infra/.env
+*.env
+
+# Claude Code per-machine config (permissions, etc.)
+.claude/settings.local.json
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp

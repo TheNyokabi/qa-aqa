@@ -1,0 +1,21 @@
+[project]
+name = "policy-svc"
+version = "0.1.0"
+description = "ABAC/RBAC policy decision service. Thin HTTP wrapper around OPA."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.4",
+    "uvicorn[standard]==0.32.0",
+    "httpx==0.27.2",
+    "pydantic==2.9.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.3",
+    "pytest-asyncio==0.24.0",
+    "anyio==4.6.2",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

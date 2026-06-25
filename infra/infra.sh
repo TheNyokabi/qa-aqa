@@ -39,6 +39,9 @@ readonly IMG_LOKI="docker.io/grafana/loki:3.0.0"
 readonly IMG_OLLAMA="docker.io/ollama/ollama:0.3.14"
 readonly IMG_LITELLM="ghcr.io/berriai/litellm:main-stable"
 readonly IMG_OPA="docker.io/openpolicyagent/opa:1.17.1"
+# Sub-project C2 — locally built images
+readonly IMG_RAG="qa-aqa/rag-service:dev"
+readonly IMG_POLICY="qa-aqa/policy-svc:dev"
 
 # Models to pre-pull on Ollama after startup (idempotent — skips if present)
 readonly OLLAMA_PRELOAD_MODELS=("nomic-embed-text" "llama3.2:3b")
@@ -68,6 +71,9 @@ readonly PORT_LOKI=3100
 readonly PORT_OLLAMA=11434
 readonly PORT_LITELLM=4000
 readonly PORT_OPA=8181
+# Sub-project C2
+readonly PORT_RAG=8001
+readonly PORT_POLICY=8002
 
 # Brew packages required on the host
 readonly BREW_PKGS=("podman" "podman-compose" "jq")
@@ -594,6 +600,54 @@ services:
       - "${PORT_OPA}:${PORT_OPA}"
     networks: [${NETWORK_NAME}]
     # OPA's distroless image has no shell — rely on host-side smoke test
+
+  # ─── Sub-project C2 ───────────────────────────────────────────────────────
+  rag-service:
+    image: ${IMG_RAG}
+    container_name: rag-service
+    environment:
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGUSER=\${POSTGRES_USER}
+      - PGPASSWORD=\${POSTGRES_PASSWORD}
+      - PGDATABASE=\${POSTGRES_DB}
+      - OPENSEARCH_URL=http://opensearch:9200
+      - OPENSEARCH_INDEX=documents
+      - MODEL_GATEWAY_URL=http://model-gateway:${PORT_LITELLM}
+      - LITELLM_MASTER_KEY=\${LITELLM_MASTER_KEY}
+      - EMBED_MODEL=embed-dev
+      - EMBED_DIM=768
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      model-gateway:
+        condition: service_started
+    ports:
+      - "${PORT_RAG}:8001"
+    networks: [${NETWORK_NAME}]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health').read()\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  policy-svc:
+    image: ${IMG_POLICY}
+    container_name: policy-svc
+    environment:
+      - OPA_URL=http://opa:${PORT_OPA}
+    depends_on:
+      - opa
+    ports:
+      - "${PORT_POLICY}:8002"
+    networks: [${NETWORK_NAME}]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health').read()\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
 EOF
     ok "wrote compose.yaml"
 }
@@ -656,6 +710,23 @@ compose() {
     podman-compose --env-file "${ENV_FILE}" -f "${DIST_DIR}/compose.yaml" "$@"
 }
 
+build_custom_images() {
+    step "5a/8  Build custom images (rag-service, policy-svc)"
+    local services=("rag" "policy")
+    local images=("${IMG_RAG}" "${IMG_POLICY}")
+    for i in "${!services[@]}"; do
+        local svc="${services[$i]}"
+        local img="${images[$i]}"
+        local ctx="${INFRA_DIR%/infra}/services/${svc}"
+        if [[ ! -d "${ctx}" ]]; then
+            warn "no source at ${ctx} — skipping ${img}"
+            continue
+        fi
+        log "podman build ${img}"
+        run_or_print "podman build -t '${img}' -f '${ctx}/Containerfile' '${ctx}'"
+    done
+}
+
 bring_up() {
     step "5/8  Pull images + start stack"
     run_or_print "(cd '${DIST_DIR}' && podman-compose --env-file '${ENV_FILE}' -f compose.yaml up -d)"
@@ -697,7 +768,7 @@ nuke() {
 
 wait_healthy() {
     step "6/8  Wait for services healthy"
-    local services=(postgres opensearch neo4j valkey prometheus grafana loki otel-collector temporal temporal-ui ollama model-gateway opa)
+    local services=(postgres opensearch neo4j valkey prometheus grafana loki otel-collector temporal temporal-ui ollama model-gateway opa rag-service policy-svc)
     local max_wait=300
     local elapsed=0
     while (( elapsed < max_wait )); do
@@ -741,6 +812,12 @@ smoke_tests() {
         "model-gateway-liveness|curl -fs http://localhost:${PORT_LITELLM}/health/liveliness >/dev/null"
         "model-gateway-embedding|curl -fs -X POST http://localhost:${PORT_LITELLM}/v1/embeddings -H 'Authorization: Bearer ${LITELLM_MASTER_KEY}' -H 'Content-Type: application/json' -d '{\"model\":\"embed-dev\",\"input\":\"hello\"}' | jq -e '.data[0].embedding | length == 768' >/dev/null"
         "opa|curl -fs http://localhost:${PORT_OPA}/health >/dev/null"
+        "rag-service-health|curl -fs http://localhost:${PORT_RAG}/health | jq -e '.status==\"ok\"' >/dev/null"
+        "rag-service-ingest|curl -fs -X POST http://localhost:${PORT_RAG}/ingest -H 'Content-Type: application/json' -d '{\"id\":\"smoke-doc-1\",\"text\":\"# Greetings\\n\\nHello world this is a smoke test document about valkey and postgres.\",\"metadata\":{\"src\":\"smoke\"}}' | jq -e '.chunks > 0' >/dev/null"
+        "rag-service-search|curl -fs -X POST http://localhost:${PORT_RAG}/search -H 'Content-Type: application/json' -d '{\"query\":\"hello postgres\",\"k\":3}' | jq -e '.hits | length > 0' >/dev/null"
+        "policy-svc-health|curl -fs http://localhost:${PORT_POLICY}/health | jq -e '.status==\"ok\"' >/dev/null"
+        "policy-svc-allow-admin|curl -fs -X POST http://localhost:${PORT_POLICY}/authorize -H 'Content-Type: application/json' -d '{\"subject\":{\"role\":\"admin\"},\"action\":\"delete\",\"resource\":{\"id\":\"x\"}}' | jq -e '.allow==true' >/dev/null"
+        "policy-svc-deny-default|curl -fs -X POST http://localhost:${PORT_POLICY}/authorize -H 'Content-Type: application/json' -d '{\"subject\":{\"role\":\"viewer\"},\"action\":\"delete\",\"resource\":{\"visibility\":\"private\"}}' | jq -e '.allow==false' >/dev/null"
     )
     for t in "${tests[@]}"; do
         local name="${t%%|*}"
@@ -769,6 +846,8 @@ smoke_tests() {
         echo "  Ollama        http://localhost:${PORT_OLLAMA}"
         echo "  model-gateway http://localhost:${PORT_LITELLM}     Bearer \${LITELLM_MASTER_KEY}"
         echo "  OPA           http://localhost:${PORT_OPA}/health"
+        echo "  rag-service   http://localhost:${PORT_RAG}     POST /ingest, /search"
+        echo "  policy-svc    http://localhost:${PORT_POLICY}     POST /authorize"
         return 0
     else
         err "${failures} smoke test(s) failed"
@@ -804,6 +883,7 @@ case "${cmd}" in
         ensure_podman_machine
         write_dist_dir
         ensure_env_file
+        build_custom_images
         bring_up
         wait_healthy
         ollama_preload

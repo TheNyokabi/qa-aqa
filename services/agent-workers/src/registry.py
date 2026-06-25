@@ -8,11 +8,13 @@ from __future__ import annotations
 from typing import Any
 
 from .workflow import DesignTestsWorkflow
+from .workflow_execute import ExecuteTestsWorkflow
 
 # (tenant_id or "*"): {workflow_type: workflow_class}
 REGISTRY: dict[str, dict[str, Any]] = {
     "*": {
         "design-tests": DesignTestsWorkflow,
+        "execute-tests": ExecuteTestsWorkflow,
     },
 }
 

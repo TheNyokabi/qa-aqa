@@ -1,0 +1,22 @@
+# Base image already has Chromium + Playwright system deps installed.
+FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    "fastapi==0.115.4" \
+    "uvicorn[standard]==0.32.0" \
+    "pydantic==2.9.2" \
+    "playwright==1.48.0" \
+    "minio==7.2.10"
+
+# The base image ships browsers; this is a no-op insurance against drift.
+RUN playwright install --with-deps chromium
+
+COPY src /app/src
+
+ENV MINIO_ENDPOINT=minio:9000 \
+    MINIO_BUCKET=executions \
+    SANDBOX_TIMEOUT_DEFAULT=120
+EXPOSE 8004
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8004"]

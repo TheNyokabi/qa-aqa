@@ -79,7 +79,10 @@ def require_tenant(x_tenant_id: str | None = Header(None, alias="X-Tenant-ID")) 
 
 
 # ── pydantic models ──────────────────────────────────────────────────────────
-ArtefactType = Literal["requirement", "test_case", "approval_policy", "critique_policy"]
+ArtefactType = Literal[
+    "requirement", "test_case", "approval_policy", "critique_policy",
+    "execution_result",  # D1.1 — payload schema is mode-discriminated
+]
 ComplianceLevel = Literal["none", "gxp", "iso17025", "sox"]
 
 

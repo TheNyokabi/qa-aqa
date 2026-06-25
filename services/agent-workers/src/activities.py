@@ -135,6 +135,78 @@ async def run_test_designer_activity(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @activity.defn
+async def fetch_artefacts_activity(req: dict[str, Any]) -> list[dict[str, Any]]:
+    """Fetch a list of artefacts by id. Used by ExecuteTestsWorkflow to load
+    test_cases produced by an earlier design-tests run."""
+    activity.heartbeat()
+    tenant_id = req["tenant_id"]
+    ids: list[str] = req["ids"]
+    async with _artefact_client(tenant_id) as client:
+        out: list[dict[str, Any]] = []
+        for aid in ids:
+            r = await client.get(f"/artefacts/{aid}")
+            r.raise_for_status()
+            out.append(r.json())
+        return out
+
+
+async def _executor_one(client: httpx.AsyncClient, payload: dict[str, Any]) -> dict[str, Any]:
+    """Pure function: run one test_case in payload['mode']. Activity wrappers
+    below call this; not decorated itself, so batch can re-use it."""
+    from . import executor_agent
+
+    tc = payload["test_case"]
+    mode = payload["mode"]
+    tenant_id = payload.get("tenant_id", config.DEFAULT_TENANT)
+    workflow_id = payload.get("workflow_id", "")
+    criticality = payload.get("criticality", "low")
+    test_case_id = tc.get("id", payload.get("test_case_id", "unknown"))
+    payload_body = tc.get("payload", tc)
+
+    docs, _doc_ids = await executor_agent.fetch_context(client, payload_body)
+    if mode == "simulate":
+        return await executor_agent.simulate_via_llm(
+            client, payload_body, docs,
+            tenant_id=tenant_id, workflow_id=workflow_id, criticality=criticality,
+        )
+    if mode == "scripts":
+        language = payload.get("language", "playwright")
+        return await executor_agent.generate_script(
+            client, payload_body, docs, language,
+            tenant_id=tenant_id, workflow_id=workflow_id, criticality=criticality,
+        )
+    if mode == "playwright_sandbox":
+        return await executor_agent.run_in_sandbox(
+            client, payload_body,
+            target_url=payload.get("target_url"),
+            timeout_seconds=payload.get("sandbox_timeout_seconds", 120),
+            tenant_id=tenant_id, workflow_id=workflow_id, test_case_id=test_case_id,
+        )
+    raise ValueError(f"unknown mode: {mode}")
+
+
+@activity.defn
+async def run_executor_activity(payload: dict[str, Any]) -> dict[str, Any]:
+    """Run a single test_case. Used for the parallel sandbox-mode path."""
+    async with _heartbeat_ticker(interval_seconds=10.0):
+        async with _http_client() as client:
+            return await _executor_one(client, payload)
+
+
+@activity.defn
+async def run_executor_batch_activity(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Serial loop over N test_cases — used for simulate / scripts (LLM-cheap)."""
+    out: list[dict[str, Any]] = []
+    async with _heartbeat_ticker(interval_seconds=10.0):
+        async with _http_client() as client:
+            for tc in payload["test_cases"]:
+                sub = {**payload, "test_case": tc}
+                sub.pop("test_cases", None)
+                out.append(await _executor_one(client, sub))
+    return out
+
+
+@activity.defn
 async def ingest_seed_docs_activity(tenant_id: str = config.DEFAULT_TENANT) -> dict[str, Any]:
     """Ingest the project spec docs into rag-service as a seed corpus.
 

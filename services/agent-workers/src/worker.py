@@ -20,7 +20,10 @@ from . import config
 from .activities import (
     bulk_create_artefacts_activity,
     create_artefact_activity,
+    fetch_artefacts_activity,
     ingest_seed_docs_activity,
+    run_executor_activity,
+    run_executor_batch_activity,
     run_test_designer_activity,
 )
 from .registry import all_workflows
@@ -93,7 +96,10 @@ async def main() -> None:
         activities=[
             create_artefact_activity,
             bulk_create_artefacts_activity,
+            fetch_artefacts_activity,
             run_test_designer_activity,
+            run_executor_activity,
+            run_executor_batch_activity,
             ingest_seed_docs_activity,
         ],
     )

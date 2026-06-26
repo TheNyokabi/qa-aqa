@@ -1,0 +1,8 @@
+# Sandbox image used by runner-service for each /runs call.
+# Base image ships Chromium + system deps but NOT the Python `playwright` pkg.
+FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
+
+RUN pip install --no-cache-dir --break-system-packages playwright==1.48.0
+
+# Browsers are already in the base image; this is a safety net.
+RUN python -c "from playwright.async_api import async_playwright; print('playwright module: ok')"

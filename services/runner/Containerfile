@@ -1,22 +1,34 @@
-# Base image already has Chromium + Playwright system deps installed.
-FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
+# D1.2 — runner-service base switched to Fedora 40 so the podman CLI inside the
+# container matches the podman-machine VM (both podman 5.x). The previous Ubuntu
+# jammy base shipped podman 3.4.4, which couldn't talk to the 5.x server.
+#
+# Runner-service no longer runs Playwright itself; it only orchestrates
+# ephemeral sandbox containers. The sandbox image is the Microsoft Playwright
+# Python image (Ubuntu-based), spawned via the bind-mounted podman socket.
+FROM fedora:40
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir \
+RUN dnf install -y --setopt=install_weak_deps=False \
+        python3.12 python3-pip \
+        podman shadow-utils \
+ && dnf clean all && rm -rf /var/cache/dnf \
+ && ln -sf /usr/bin/python3 /usr/bin/python
+
+RUN pip3 install --no-cache-dir \
     "fastapi==0.115.4" \
     "uvicorn[standard]==0.32.0" \
     "pydantic==2.9.2" \
-    "playwright==1.48.0" \
     "minio==7.2.10"
-
-# The base image ships browsers; this is a no-op insurance against drift.
-RUN playwright install --with-deps chromium
 
 COPY src /app/src
 
 ENV MINIO_ENDPOINT=minio:9000 \
     MINIO_BUCKET=executions \
-    SANDBOX_TIMEOUT_DEFAULT=120
+    SANDBOX_TIMEOUT_DEFAULT=120 \
+    SANDBOX_IMAGE=mcr.microsoft.com/playwright/python:v1.48.0-jammy \
+    SANDBOX_NETWORK=sandbox-egress \
+    CONTAINER_HOST=unix:///run/podman/podman.sock \
+    SANDBOX_TMP_BASE=/sandbox-tmp
 EXPOSE 8004
 CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8004"]

@@ -72,6 +72,7 @@ class ExecuteTestsWorkflow:
                             "tenant_id": tenant_id,
                             "workflow_id": wf_id,
                             "criticality": req.get("criticality", "low"),
+                            "allowed_urls": req.get("allowed_urls", []),
                         }],
                         start_to_close_timeout=timedelta(seconds=req.get("sandbox_timeout_seconds", 120) + 60),
                         heartbeat_timeout=timedelta(seconds=30),

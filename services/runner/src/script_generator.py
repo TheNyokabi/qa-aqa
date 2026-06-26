@@ -16,16 +16,22 @@ SUPPORTED_KEYWORDS = {
 }
 
 
-def generate_script(test_case: dict[str, Any], target_url: str | None, timeout_seconds: int) -> str:
-    # Use repr() of JSON strings — produces a properly-escaped Python literal
-    # that survives any quote characters in the input. The previous r""" """
-    # wrapper broke when the JSON contained embedded quote sequences.
+def generate_script(
+    test_case: dict[str, Any],
+    target_url: str | None,
+    timeout_seconds: int,
+    *,
+    proxy_url: str | None = None,
+    sandbox_id: str = "",
+) -> str:
     payload = test_case.get("payload", test_case)
     return _SCRIPT_TEMPLATE.format(
         test_case_json_literal=repr(json.dumps(payload)),
         target_url_json_literal=repr(json.dumps(target_url)),
         timeout_seconds=int(timeout_seconds),
         supported_keywords_literal=repr(sorted(SUPPORTED_KEYWORDS)),
+        proxy_url_literal=repr(proxy_url or ""),
+        sandbox_id_literal=repr(sandbox_id),
     )
 
 
@@ -53,6 +59,8 @@ TEST_CASE = json.loads({test_case_json_literal})
 TARGET_URL = json.loads({target_url_json_literal})
 TIMEOUT_S = {timeout_seconds}
 SUPPORTED = set({supported_keywords_literal})
+PROXY_URL = {proxy_url_literal}
+SANDBOX_ID = {sandbox_id_literal}
 
 
 def _result(status, error_message="", started=None):
@@ -72,7 +80,11 @@ async def _do_step(page, step, idx):
     kw = step.get("keyword", "")
     args = step.get("args", []) or []
     if kw == "goto":
-        await page.goto(args[0])
+        # D1.3 — proxy returns 403 for denied URLs; treat HTTP 4xx/5xx as
+        # failure rather than silently navigating to an error page.
+        response = await page.goto(args[0])
+        if response and response.status >= 400:
+            raise AssertionError(f"goto {{args[0]!r}} returned HTTP {{response.status}}")
     elif kw == "click":
         await page.click(args[0])
     elif kw == "fill":
@@ -117,8 +129,16 @@ async def main():
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            ctx = await browser.new_context()
+            launch_kwargs = {{"headless": True}}
+            if PROXY_URL:
+                launch_kwargs["proxy"] = {{"server": PROXY_URL}}
+            browser = await p.chromium.launch(**launch_kwargs)
+            # D1.3 — trust mitmproxy's MITM cert. Chromium uses its own cert
+            # store, not the OS one; ignore_https_errors=True is the standard
+            # dev-mode answer. Sandbox is ephemeral + isolated, so this is safe.
+            ctx = await browser.new_context(ignore_https_errors=True)
+            if SANDBOX_ID:
+                await ctx.set_extra_http_headers({{"X-QA-Sandbox-ID": SANDBOX_ID}})
             page = await ctx.new_page()
             page.on("console", lambda msg: console_lines.append(f"{{msg.type}}: {{msg.text}}"))
             page.on("pageerror", lambda exc: page_errors.append(str(exc)))

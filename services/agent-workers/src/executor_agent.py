@@ -155,6 +155,7 @@ async def run_in_sandbox(
     tenant_id: str,
     workflow_id: str,
     test_case_id: str,
+    allowed_urls: list[str] | None = None,
 ) -> dict[str, Any]:
     body = {
         "test_case": test_case,
@@ -163,6 +164,7 @@ async def run_in_sandbox(
         "tenant_id": tenant_id,
         "workflow_id": workflow_id,
         "test_case_id": test_case_id,
+        "allowed_urls": allowed_urls or [],
     }
     r = await client.post(f"{config.RUNNER_URL}/runs", json=body, timeout=httpx.Timeout(timeout_seconds + 60))
     r.raise_for_status()

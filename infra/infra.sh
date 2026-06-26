@@ -55,6 +55,7 @@ readonly IMG_MINIO="docker.io/minio/minio:RELEASE.2024-10-13T13-34-11Z"
 readonly IMG_MINIO_MC="docker.io/minio/mc:RELEASE.2024-10-08T09-37-26Z"
 readonly IMG_RUNNER="qa-aqa/runner-service:dev"
 readonly IMG_SANDBOX="qa-aqa/sandbox:dev"   # D1.2 — Playwright Python pre-installed
+readonly IMG_PROXY="qa-aqa/proxy-service:dev"  # D1.3 — mitmproxy + allowlist addon
 
 # Models to pre-pull on Ollama after startup (idempotent — skips if present)
 readonly OLLAMA_PRELOAD_MODELS=("nomic-embed-text" "llama3.2:3b")
@@ -93,6 +94,8 @@ readonly PORT_ARTEFACT=8003
 readonly PORT_RUNNER=8004
 readonly PORT_MINIO_API=9101    # S3 API on host
 readonly PORT_MINIO_WEB=9100    # Web console on host
+# D1.3
+readonly PORT_PROXY_ADMIN=8083  # mitmproxy admin endpoint exposed to host (debug)
 
 # Brew packages required on the host
 readonly BREW_PKGS=("podman" "podman-compose" "jq")
@@ -398,6 +401,7 @@ volumes:
   ollama-data:
   minio-data:
   runner-tmp:
+  mitm-ca:           # D1.3 — persists mitmproxy's CA between restarts
 
 services:
   postgres:
@@ -677,6 +681,29 @@ services:
       timeout: 5s
       retries: 20
 
+  # ─── Sub-project D1.3 — TLS-MITM egress proxy ────────────────────────────
+  proxy-service:
+    image: ${IMG_PROXY}
+    container_name: proxy-service
+    security_opt:
+      - "label=disable"
+    user: "0:0"
+    volumes:
+      - mitm-ca:/home/mitmproxy/.mitmproxy
+      # Same VM-host bind-mount runner-service uses for allowlist configs.
+      - /tmp/proxy-allowlists:/tmp/proxy-allowlists:ro
+    ports:
+      # Proxy listener (only useful from inside sandbox-egress; published for
+      # debug introspection from the host).
+      - "${PORT_PROXY_ADMIN}:8080"
+    networks: [${SANDBOX_NETWORK}]
+    healthcheck:
+      # mitmproxy itself doesn't expose /health; we check by tcp-probing 8080.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8080' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
   # ─── Sub-project D0.5 ─────────────────────────────────────────────────────
   artefact-service:
     image: ${IMG_ARTEFACT}
@@ -738,8 +765,14 @@ services:
       - SANDBOX_TMP_BASE=/sandbox-tmp
       - CONTAINER_HOST=unix:///run/podman/podman.sock
       - SANDBOX_TMP_HOST_BASE=/tmp/runner-sandboxes
+      - PROXY_URL=http://proxy-service:8080
+      - MITM_CA_DIR=/mitm-ca
+      - PROXY_ALLOWLIST_HOST_DIR=/tmp/proxy-allowlists
+      - PROXY_ALLOWLIST_DIR=/proxy-allowlists
     depends_on:
       minio:
+        condition: service_healthy
+      proxy-service:
         condition: service_healthy
     ports:
       - "${PORT_RUNNER}:8004"
@@ -756,6 +789,10 @@ services:
       # podman command needs to mount the same VM path into the sandbox.
       # The VM dir is created by infra.sh before compose up.
       - /tmp/runner-sandboxes:/sandbox-tmp
+      # D1.3 — read-only CA cert mount (copied into sandbox per run)
+      - mitm-ca:/mitm-ca:ro
+      # D1.3 — per-sandbox allow-list configs that proxy-service reads
+      - /tmp/proxy-allowlists:/proxy-allowlists
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8004/health').read()\" || exit 1"]
       interval: 10s
@@ -861,9 +898,9 @@ compose() {
 }
 
 build_custom_images() {
-    step "5a/8  Build custom images (rag, policy, artefact, agent-workers, runner, sandbox)"
-    local services=("rag" "policy" "artefact" "agent-workers" "runner" "sandbox-image")
-    local images=("${IMG_RAG}" "${IMG_POLICY}" "${IMG_ARTEFACT}" "${IMG_AGENT_WORKERS}" "${IMG_RUNNER}" "${IMG_SANDBOX}")
+    step "5a/8  Build custom images (rag, policy, artefact, agent-workers, runner, sandbox, proxy)"
+    local services=("rag" "policy" "artefact" "agent-workers" "runner" "sandbox-image" "proxy")
+    local images=("${IMG_RAG}" "${IMG_POLICY}" "${IMG_ARTEFACT}" "${IMG_AGENT_WORKERS}" "${IMG_RUNNER}" "${IMG_SANDBOX}" "${IMG_PROXY}")
     for i in "${!services[@]}"; do
         local svc="${services[$i]}"
         local img="${images[$i]}"
@@ -904,6 +941,10 @@ ensure_sandbox_tmp_dir() {
     # podman daemon spawns sandbox containers), not just inside runner-service.
     log "ensuring sandbox tmp dir exists on VM: /tmp/runner-sandboxes"
     run_or_print "podman machine ssh 'sudo mkdir -p /tmp/runner-sandboxes && sudo chmod 1777 /tmp/runner-sandboxes' >/dev/null 2>&1 || true"
+    # D1.3 — per-sandbox proxy allow-list dir, shared between runner-service
+    # (writes) and proxy-service (reads).
+    log "ensuring proxy allow-list dir exists on VM: /tmp/proxy-allowlists"
+    run_or_print "podman machine ssh 'sudo mkdir -p /tmp/proxy-allowlists && sudo chmod 1777 /tmp/proxy-allowlists' >/dev/null 2>&1 || true"
 }
 
 bring_up() {
@@ -950,7 +991,7 @@ nuke() {
 
 wait_healthy() {
     step "6/8  Wait for services healthy"
-    local services=(postgres opensearch neo4j valkey prometheus grafana loki otel-collector temporal temporal-ui ollama model-gateway opa rag-service policy-svc artefact-service minio runner-service agent-workers)
+    local services=(postgres opensearch neo4j valkey prometheus grafana loki otel-collector temporal temporal-ui ollama model-gateway opa rag-service policy-svc artefact-service minio proxy-service runner-service agent-workers)
     local max_wait=300
     local elapsed=0
     while (( elapsed < max_wait )); do
@@ -1170,7 +1211,7 @@ smoke_sandbox_cleanup() {
 {"id":"${tc_id}","type":"test_case","payload":{"title":"cleanup","steps":[{"library":"playwright","keyword":"goto","args":["https://example.com"]},{"library":"playwright","keyword":"screenshot","args":["x"]}],"expected_result":"loaded","traceability_to_requirement":"smoke"},"actor":"${tc_actor}"}
 JSON
 )" >/dev/null || return 1
-    local input='{"test_case_ids":["'"${tc_id}"'"],"mode":"playwright_sandbox","target_url":"https://example.com","sandbox_timeout_seconds":60}'
+    local input='{"test_case_ids":["'"${tc_id}"'"],"mode":"playwright_sandbox","target_url":"https://example.com","sandbox_timeout_seconds":60,"allowed_urls":["https://example.com/*","http://example.com/*"]}'
     podman exec agent-workers python -m src.start_workflow execute-tests "${input}" default --wait >/dev/null 2>&1 || return 2
     # Poll for cleanup: must drop to zero within 30s
     local elapsed=0
@@ -1195,7 +1236,9 @@ smoke_sandbox_isolation() {
 {"id":"${tc_id}","type":"test_case","payload":{"title":"isolation probe","steps":[{"library":"playwright","keyword":"goto","args":["http://artefact-service:8003/health"]}],"expected_result":"must NOT be reachable","traceability_to_requirement":"smoke"},"actor":"${tc_actor}"}
 JSON
 )" >/dev/null || return 1
-    local input='{"test_case_ids":["'"${tc_id}"'"],"mode":"playwright_sandbox","sandbox_timeout_seconds":30}'
+    # D1.3 — pass an allow-list that does NOT include artefact-service.
+    # Sandbox should fail both because of proxy deny AND network isolation.
+    local input='{"test_case_ids":["'"${tc_id}"'"],"mode":"playwright_sandbox","sandbox_timeout_seconds":30,"allowed_urls":["https://example.com/*"]}'
     local out
     out=$(podman exec agent-workers python -m src.start_workflow execute-tests "${input}" default --wait 2>&1) || return 2
     local er_id
@@ -1207,6 +1250,64 @@ JSON
     status=$(echo "${payload}" | jq -r '.status')
     # Must NOT be a pass — sandbox should fail to reach internal services
     [[ "${status}" == "fail" || "${status}" == "error" || "${status}" == "timeout" ]] || return 4
+    return 0
+}
+
+smoke_proxy_d1_3_suite() {
+    # D1.3 proves strict-default deny + allow path + deny path.
+    local tenant=default
+    local stamp="proxy-$(date +%s)-$$"
+    local actor='urn:qa-aqa:user:smoke'
+    _post_tc() {
+        local id="$1" target_url="$2"
+        curl -fs -H "X-Tenant-ID:${tenant}" -H 'Content-Type:application/json' \
+            -X POST "http://localhost:${PORT_ARTEFACT}/artefacts" -d "$(cat <<JSON
+{"id":"test_case:${id}","type":"test_case","payload":{"title":"proxy probe","steps":[{"library":"playwright","keyword":"goto","args":["${target_url}"]}],"expected_result":"goto","traceability_to_requirement":"smoke"},"actor":"${actor}"}
+JSON
+)" >/dev/null
+    }
+    _run_workflow() {
+        local input="$1"
+        local out
+        out=$(podman exec agent-workers python -m src.start_workflow execute-tests "${input}" default --wait 2>&1) || return 1
+        echo "${out}" | grep -E '"result"' | tail -1
+    }
+    _get_payload() {
+        local id="$1"
+        curl -fs -H "X-Tenant-ID:${tenant}" "http://localhost:${PORT_ARTEFACT}/artefacts/${id}" | jq -r '.payload'
+    }
+
+    # Test 1 — strict-default deny (no allowed_urls)
+    _post_tc "${stamp}-strict" "https://example.com" || return 1
+    local line1
+    line1=$(_run_workflow '{"test_case_ids":["test_case:'${stamp}'-strict"],"mode":"playwright_sandbox","target_url":"https://example.com","sandbox_timeout_seconds":30}') || return 2
+    local er1; er1=$(echo "${line1}" | jq -r '.result.execution_result_ids[0]')
+    local p1; p1=$(_get_payload "${er1}")
+    local status1; status1=$(echo "${p1}" | jq -r '.status')
+    [[ "${status1}" != "pass" ]] || return 3   # should NOT pass
+
+    # Test 2 — explicit allow for example.com → pass
+    _post_tc "${stamp}-allow" "https://example.com" || return 4
+    local line2
+    line2=$(_run_workflow '{"test_case_ids":["test_case:'${stamp}'-allow"],"mode":"playwright_sandbox","target_url":"https://example.com","sandbox_timeout_seconds":60,"allowed_urls":["https://example.com/*","http://example.com/*"]}') || return 5
+    local er2; er2=$(echo "${line2}" | jq -r '.result.execution_result_ids[0]')
+    local p2; p2=$(_get_payload "${er2}")
+    local status2; status2=$(echo "${p2}" | jq -r '.status')
+    [[ "${status2}" == "pass" ]] || return 6
+
+    # Test 3 — allow example.com but visit example.org → fail with denied
+    _post_tc "${stamp}-deny" "https://example.org" || return 7
+    local line3
+    line3=$(_run_workflow '{"test_case_ids":["test_case:'${stamp}'-deny"],"mode":"playwright_sandbox","target_url":"https://example.org","sandbox_timeout_seconds":30,"allowed_urls":["https://example.com/*"]}') || return 8
+    local er3; er3=$(echo "${line3}" | jq -r '.result.execution_result_ids[0]')
+    local p3; p3=$(_get_payload "${er3}")
+    local status3; status3=$(echo "${p3}" | jq -r '.status')
+    [[ "${status3}" != "pass" ]] || return 9
+    local err3; err3=$(echo "${p3}" | jq -r '.error_message // ""')
+    # Either the proxy returned 403 or the sandbox couldn't TLS-handshake — both
+    # acceptable as "denied".
+    echo "${err3}" | grep -qE 'denied|403|net::' || return 10
+
     return 0
 }
 
@@ -1251,6 +1352,8 @@ smoke_tests() {
         "sandbox-no-cross-network|! podman network inspect sandbox-egress 2>/dev/null | jq -r '.[0].containers // {} | keys[]?' | xargs -I{} podman inspect {} --format '{{.NetworkSettings.Networks}}' 2>/dev/null | grep -q qa-aqa"
         "sandbox-cleanup|smoke_sandbox_cleanup"
         "sandbox-isolation|smoke_sandbox_isolation"
+        "proxy-tcp-up|bash -c '</dev/tcp/127.0.0.1/${PORT_PROXY_ADMIN}' 2>&1 | grep -qE '^$' || true; (echo > /dev/tcp/127.0.0.1/${PORT_PROXY_ADMIN}) 2>/dev/null"
+        "proxy-d1-3-suite|smoke_proxy_d1_3_suite"
     )
     for t in "${tests[@]}"; do
         local name="${t%%|*}"

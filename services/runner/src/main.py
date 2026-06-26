@@ -40,6 +40,9 @@ class RunRequest(BaseModel):
     tenant_id: str
     workflow_id: str
     test_case_id: str
+    # D1.3 — strict-default deny: missing/empty list means the sandbox cannot
+    # reach anything through the proxy.
+    allowed_urls: list[str] = Field(default_factory=list)
 
 
 @app.get("/health")
@@ -60,6 +63,7 @@ async def run(req: RunRequest) -> dict[str, Any]:
             test_case_id=req.test_case_id,
             sandbox_id=sandbox_id,
             bucket=BUCKET,
+            allowed_urls=req.allowed_urls,
         )
     except Exception as e:  # noqa: BLE001
         log.exception("sandbox run failed (id=%s)", sandbox_id)

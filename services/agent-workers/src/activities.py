@@ -181,6 +181,7 @@ async def _executor_one(client: httpx.AsyncClient, payload: dict[str, Any]) -> d
             target_url=payload.get("target_url"),
             timeout_seconds=payload.get("sandbox_timeout_seconds", 120),
             tenant_id=tenant_id, workflow_id=workflow_id, test_case_id=test_case_id,
+            allowed_urls=payload.get("allowed_urls", []),
         )
     raise ValueError(f"unknown mode: {mode}")
 

@@ -17,6 +17,8 @@ import shutil
 import time
 from pathlib import Path
 
+# Cleanup of allowlist files on exit — kept short to avoid stale entries.
+
 from . import script_generator, storage
 
 SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "mcr.microsoft.com/playwright/python:v1.48.0-jammy")
@@ -27,6 +29,11 @@ SANDBOX_TMP_BASE = Path(os.environ.get("SANDBOX_TMP_BASE", "/sandbox-tmp"))
 # podman run -v sees VM paths, not runner-service container paths.
 SANDBOX_TMP_HOST_BASE = os.environ.get("SANDBOX_TMP_HOST_BASE", "/tmp/runner-sandboxes")
 CONTAINER_HOST = os.environ.get("CONTAINER_HOST", "unix:///run/podman/podman.sock")
+# D1.3 — TLS-intercepting forward proxy
+PROXY_URL = os.environ.get("PROXY_URL", "http://proxy-service:8080")
+MITM_CA_DIR = Path(os.environ.get("MITM_CA_DIR", "/mitm-ca"))
+PROXY_ALLOWLIST_HOST_DIR = os.environ.get("PROXY_ALLOWLIST_HOST_DIR", "/tmp/proxy-allowlists")
+PROXY_ALLOWLIST_DIR = Path(os.environ.get("PROXY_ALLOWLIST_DIR", "/proxy-allowlists"))
 
 CONTAINER_NAME_PREFIX = "qa-aqa-sandbox-"
 GRACE_SECONDS = 10
@@ -83,23 +90,40 @@ async def run_sandbox(
     test_case_id: str,
     sandbox_id: str,
     bucket: str,
+    allowed_urls: list[str] | None = None,
 ) -> dict:
     """Spawn ephemeral container, run, capture, upload, return execution_result."""
     storage.ensure_bucket(bucket)
 
     work_dir = SANDBOX_TMP_BASE / sandbox_id
     work_dir.mkdir(parents=True, exist_ok=True)
-    script_path = work_dir / "script.py"
-    script_path.write_text(script_generator.generate_script(test_case, target_url, timeout_seconds))
     (work_dir / "screenshots").mkdir(exist_ok=True)
+    script_path = work_dir / "script.py"
+    script_path.write_text(
+        script_generator.generate_script(
+            test_case, target_url, timeout_seconds,
+            proxy_url=PROXY_URL,
+            sandbox_id=sandbox_id,
+        )
+    )
+
+    # D1.3 — write per-sandbox allow-list config that proxy-service reads.
+    PROXY_ALLOWLIST_DIR.mkdir(parents=True, exist_ok=True)
+    allowlist_file = PROXY_ALLOWLIST_DIR / f"{sandbox_id}.json"
+    allowlist_file.write_text(json.dumps({"allowed_urls": allowed_urls or []}))
+
+    # D1.3 — copy CA cert into the per-sandbox work_dir so the sandbox trusts
+    # mitmproxy's MITM. We can't bake into the image without a rebuild, so we
+    # mount it at runtime.
+    ca_src = MITM_CA_DIR / "mitmproxy-ca-cert.pem"
+    ca_in_work = work_dir / "qa-aqa-mitmproxy-ca.pem"
+    if ca_src.exists():
+        ca_in_work.write_bytes(ca_src.read_bytes())
 
     container_name = f"{CONTAINER_NAME_PREFIX}{sandbox_id}"
     started = time.time()
     overall_timeout = timeout_seconds + GRACE_SECONDS
 
-    # The -v path on the LEFT must exist on the VM, not inside runner-service.
-    # runner-service sees the dir at work_dir; the sandbox container needs
-    # the equivalent VM-side host path (set via SANDBOX_TMP_HOST_BASE).
     host_work_dir = f"{SANDBOX_TMP_HOST_BASE}/{sandbox_id}"
     cmd = [
         "run", "--rm",
@@ -109,10 +133,14 @@ async def run_sandbox(
         "--memory", "2g",
         "--pids-limit", "200",
         "--user", "0:0",
-        # Disable SELinux container labels — the bind-mounted /work dir is
-        # owned by a different user namespace and SELinux blocks access by
-        # default. Dev only; production uses a dedicated runner pool.
         "--security-opt", "label=disable",
+        # D1.3 — route HTTPS through mitmproxy; sandbox trusts our CA.
+        "-e", f"HTTP_PROXY={PROXY_URL}",
+        "-e", f"HTTPS_PROXY={PROXY_URL}",
+        "-e", "SSL_CERT_FILE=/work/qa-aqa-mitmproxy-ca.pem",
+        "-e", "REQUESTS_CA_BUNDLE=/work/qa-aqa-mitmproxy-ca.pem",
+        "-e", f"QA_SANDBOX_ID={sandbox_id}",
+        "-e", f"PROXY_URL={PROXY_URL}",
         "-v", f"{host_work_dir}:/work",
         "-w", "/work",
         SANDBOX_IMAGE,
@@ -163,9 +191,13 @@ async def run_sandbox(
     if console_path.exists():
         console_url = storage.upload_file(bucket, f"{key_prefix}/console.log", console_path, "text/plain")
 
-    # Cleanup workdir
+    # Cleanup workdir + allowlist file
     try:
         shutil.rmtree(work_dir, ignore_errors=True)
+    except Exception:
+        pass
+    try:
+        (PROXY_ALLOWLIST_DIR / f"{sandbox_id}.json").unlink(missing_ok=True)
     except Exception:
         pass
 

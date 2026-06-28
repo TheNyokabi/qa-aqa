@@ -1,0 +1,11 @@
+# Dev users. Passwords are plaintext here; the BFF bcrypts them at startup
+# for in-memory storage. v1 dev only — production OIDC lands in D3.1.
+- email: admin@qa-aqa.local
+  password: admin123
+  role: admin
+- email: reviewer@qa-aqa.local
+  password: reviewer123
+  role: reviewer
+- email: viewer@qa-aqa.local
+  password: viewer123
+  role: viewer

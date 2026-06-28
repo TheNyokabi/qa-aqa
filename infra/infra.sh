@@ -56,6 +56,11 @@ readonly IMG_MINIO_MC="docker.io/minio/mc:RELEASE.2024-10-08T09-37-26Z"
 readonly IMG_RUNNER="qa-aqa/runner-service:dev"
 readonly IMG_SANDBOX="qa-aqa/sandbox:dev"   # D1.2 — Playwright Python pre-installed
 readonly IMG_PROXY="qa-aqa/proxy-service:dev"  # D1.3 — mitmproxy + allowlist addon
+# Sub-project D3a
+readonly IMG_APISIX="docker.io/apache/apisix:3.10.0-debian"
+readonly IMG_BFF="qa-aqa/bff:dev"
+readonly IMG_WEB="qa-aqa/web-app:dev"
+# NB: etcd was dropped in favour of APISIX standalone YAML mode.
 
 # Models to pre-pull on Ollama after startup (idempotent — skips if present)
 readonly OLLAMA_PRELOAD_MODELS=("nomic-embed-text" "llama3.2:3b")
@@ -96,6 +101,11 @@ readonly PORT_MINIO_API=9101    # S3 API on host
 readonly PORT_MINIO_WEB=9100    # Web console on host
 # D1.3
 readonly PORT_PROXY_ADMIN=8083  # mitmproxy admin endpoint exposed to host (debug)
+# D3a
+readonly PORT_APISIX_PROXY=9080
+readonly PORT_APISIX_ADMIN=9180
+readonly PORT_BFF=8005
+readonly APISIX_ADMIN_KEY="qa-aqa-dev-admin-key"
 
 # Brew packages required on the host
 readonly BREW_PKGS=("podman" "podman-compose" "jq")
@@ -209,7 +219,8 @@ write_dist_dir() {
         "${DIST_DIR}/grafana/provisioning/datasources" \
         "${DIST_DIR}/loki" \
         "${DIST_DIR}/litellm" \
-        "${DIST_DIR}/opa/policies/qa_aqa"
+        "${DIST_DIR}/opa/policies/qa_aqa" \
+        "${DIST_DIR}/apisix"
 
     cat >"${DIST_DIR}/postgres-init/01-temporal.sql" <<'EOF'
 -- Create temporal user + databases for the temporal auto-setup container
@@ -355,6 +366,38 @@ general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
 EOF
     ok "wrote litellm/config.yaml"
+
+    # APISIX in standalone YAML mode — no etcd dependency for v1 dev.
+    cat >"${DIST_DIR}/apisix/config.yaml" <<EOF
+apisix:
+  node_listen: 9080
+  enable_admin: false   # standalone mode; admin API disabled
+deployment:
+  role: data_plane
+  role_data_plane:
+    config_provider: yaml
+EOF
+    ok "wrote apisix/config.yaml"
+
+    # APISIX standalone routes file. The trailing #END marker is required.
+    cat >"${DIST_DIR}/apisix/apisix.yaml" <<'EOF'
+routes:
+  - id: api-bff
+    uri: /api/*
+    upstream:
+      type: roundrobin
+      nodes:
+        bff:8005: 1
+  - id: web-spa
+    uri: /*
+    priority: 0
+    upstream:
+      type: roundrobin
+      nodes:
+        web-app:80: 1
+#END
+EOF
+    ok "wrote apisix/apisix.yaml"
 
     cat >"${DIST_DIR}/opa/policies/qa_aqa/authz.rego" <<'EOF'
 package qa_aqa.authz
@@ -681,6 +724,62 @@ services:
       timeout: 5s
       retries: 20
 
+  # ─── Sub-project D3a — APISIX (standalone YAML) + BFF + web-app ─────────
+  apisix:
+    image: ${IMG_APISIX}
+    container_name: apisix
+    ports:
+      - "${PORT_APISIX_PROXY}:9080"
+    volumes:
+      - ./apisix/config.yaml:/usr/local/apisix/conf/config.yaml:Z
+      - ./apisix/apisix.yaml:/usr/local/apisix/conf/apisix.yaml:Z
+    networks: [${NETWORK_NAME}]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9080/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  bff:
+    image: ${IMG_BFF}
+    container_name: bff
+    environment:
+      - BFF_PORT=8005
+      - ARTEFACT_URL=http://artefact-service:8003
+      - TEMPORAL_HOST=temporal:7233
+      - TEMPORAL_TASK_QUEUE=test-design
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_BUCKET=executions
+      - MINIO_ROOT_USER=\${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=\${MINIO_ROOT_PASSWORD}
+      - BFF_JWT_SECRET=\${BFF_JWT_SECRET}
+      - CORS_ALLOW_ORIGINS=http://localhost:${PORT_APISIX_PROXY},http://localhost:5173
+    depends_on:
+      artefact-service:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "${PORT_BFF}:8005"
+    networks: [${NETWORK_NAME}]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8005/api/health').read()\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  web-app:
+    image: ${IMG_WEB}
+    container_name: web-app
+    networks: [${NETWORK_NAME}]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:80/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
   # ─── Sub-project D1.3 — TLS-MITM egress proxy ────────────────────────────
   proxy-service:
     image: ${IMG_PROXY}
@@ -857,6 +956,7 @@ ANTHROPIC_API_KEY=${DEFAULT_ANTHROPIC_API_KEY}
 OPENAI_API_KEY=${DEFAULT_OPENAI_API_KEY}
 MINIO_ROOT_USER=${DEFAULT_MINIO_ROOT_USER}
 MINIO_ROOT_PASSWORD=${minio_pw}
+BFF_JWT_SECRET=$(openssl rand -hex 32)
 EOF
         chmod 600 "${ENV_FILE}"
         ok ".env created with defaults"
@@ -882,6 +982,7 @@ EOF
     _append_if_missing OPENAI_API_KEY "${DEFAULT_OPENAI_API_KEY}"
     _append_if_missing MINIO_ROOT_USER "${DEFAULT_MINIO_ROOT_USER}"
     _append_if_missing MINIO_ROOT_PASSWORD "$(openssl rand -hex 24)"
+    _append_if_missing BFF_JWT_SECRET "$(openssl rand -hex 32)"
     if (( appended == 0 )); then
         ok ".env already complete"
     else
@@ -898,13 +999,17 @@ compose() {
 }
 
 build_custom_images() {
-    step "5a/8  Build custom images (rag, policy, artefact, agent-workers, runner, sandbox, proxy)"
-    local services=("rag" "policy" "artefact" "agent-workers" "runner" "sandbox-image" "proxy")
-    local images=("${IMG_RAG}" "${IMG_POLICY}" "${IMG_ARTEFACT}" "${IMG_AGENT_WORKERS}" "${IMG_RUNNER}" "${IMG_SANDBOX}" "${IMG_PROXY}")
+    step "5a/8  Build custom images (rag, policy, artefact, agent-workers, runner, sandbox, proxy, bff, web)"
+    local services=("rag" "policy" "artefact" "agent-workers" "runner" "sandbox-image" "proxy" "bff" "web-app")
+    local images=("${IMG_RAG}" "${IMG_POLICY}" "${IMG_ARTEFACT}" "${IMG_AGENT_WORKERS}" "${IMG_RUNNER}" "${IMG_SANDBOX}" "${IMG_PROXY}" "${IMG_BFF}" "${IMG_WEB}")
     for i in "${!services[@]}"; do
         local svc="${services[$i]}"
         local img="${images[$i]}"
+        # Lookup: services/<svc> first, then clients/<svc-stripped> for the web app
         local ctx="${INFRA_DIR%/infra}/services/${svc}"
+        if [[ ! -d "${ctx}" && "${svc}" == "web-app" ]]; then
+            ctx="${INFRA_DIR%/infra}/clients/web"
+        fi
         if [[ ! -d "${ctx}" ]]; then
             warn "no source at ${ctx} — skipping ${img}"
             continue
@@ -991,7 +1096,7 @@ nuke() {
 
 wait_healthy() {
     step "6/8  Wait for services healthy"
-    local services=(postgres opensearch neo4j valkey prometheus grafana loki otel-collector temporal temporal-ui ollama model-gateway opa rag-service policy-svc artefact-service minio proxy-service runner-service agent-workers)
+    local services=(postgres opensearch neo4j valkey prometheus grafana loki otel-collector temporal temporal-ui ollama model-gateway opa rag-service policy-svc artefact-service minio proxy-service runner-service agent-workers apisix bff web-app)
     local max_wait=300
     local elapsed=0
     while (( elapsed < max_wait )); do
@@ -1085,15 +1190,28 @@ smoke_artefact_d05_suite() {
 
 _wait_for_log() {
     # Poll a container's logs for a regex, up to max_wait seconds. Returns 0 on match.
+    # NB: We deliberately route logs through a temp file rather than a pipe.
+    # `set -o pipefail` + early grep -q exit triggers SIGPIPE on podman logs,
+    # which makes the pipeline return non-zero even when grep succeeded.
     local container="$1" pattern="$2" max_wait="${3:-120}"
+    local tmpf
+    tmpf=$(mktemp)
+    podman logs "${container}" >"${tmpf}" 2>&1 || true
+    if grep -qE "${pattern}" "${tmpf}"; then
+        rm -f "${tmpf}"
+        return 0
+    fi
     local elapsed=0
     while (( elapsed < max_wait )); do
-        if podman logs --tail 500 "${container}" 2>&1 | grep -qE "${pattern}"; then
+        podman logs --tail 500 "${container}" >"${tmpf}" 2>&1 || true
+        if grep -qE "${pattern}" "${tmpf}"; then
+            rm -f "${tmpf}"
             return 0
         fi
         sleep 3
         elapsed=$((elapsed + 3))
     done
+    rm -f "${tmpf}"
     return 1
 }
 
@@ -1311,6 +1429,47 @@ JSON
     return 0
 }
 
+smoke_bff_d3a_suite() {
+    # D3a end-to-end: login -> list workflows -> transition an artefact.
+    local base="http://localhost:${PORT_APISIX_PROXY}/api"
+    # 1) login as reviewer
+    local login_body
+    login_body=$(curl -fs -X POST -H 'Content-Type: application/json' "${base}/auth/login" \
+        -d '{"email":"reviewer@qa-aqa.local","password":"reviewer123"}') || return 1
+    local token; token=$(echo "${login_body}" | jq -r '.access_token')
+    [[ -n "${token}" && "${token}" != "null" ]] || return 2
+    local role; role=$(echo "${login_body}" | jq -r '.user.role')
+    [[ "${role}" == "reviewer" ]] || return 3
+
+    # 2) /api/me reflects token
+    local me; me=$(curl -fs -H "Authorization: Bearer ${token}" "${base}/me" | jq -r '.email')
+    [[ "${me}" == "reviewer@qa-aqa.local" ]] || return 4
+
+    # 3) Create a fresh artefact directly via artefact-service so we have something to transition.
+    local stamp="d3a-$(date +%s)-$$"
+    local aid="test_case:${stamp}"
+    curl -fs -H 'X-Tenant-ID: default' -H 'Content-Type: application/json' \
+        -X POST "http://localhost:${PORT_ARTEFACT}/artefacts" \
+        -d "{\"id\":\"${aid}\",\"type\":\"test_case\",\"payload\":{\"title\":\"d3a smoke\",\"steps\":[],\"expected_result\":\"-\",\"traceability_to_requirement\":\"-\"},\"actor\":\"urn:qa-aqa:user:smoke\",\"workflow_id\":\"default:d3a-smoke:${stamp}\"}" >/dev/null || return 5
+
+    # 4) Transition via BFF (which stamps the actor from the JWT)
+    local trans; trans=$(curl -fs -H "Authorization: Bearer ${token}" -H 'Content-Type: application/json' \
+        -X POST "${base}/artefacts/${aid}/transition" -d '{"to_state":"in_review"}')
+    local new_state; new_state=$(echo "${trans}" | jq -r '.state')
+    [[ "${new_state}" == "in_review" ]] || return 6
+
+    # 5) History shows the transition with the user's URN as actor
+    local hist; hist=$(curl -fs -H "Authorization: Bearer ${token}" "${base}/artefacts/${aid}/history")
+    local actor; actor=$(echo "${hist}" | jq -r '[.[] | select(.policy_version != null)] | last.actor')
+    [[ "${actor}" == "urn:qa-aqa:user:reviewer" ]] || return 7
+
+    # 6) Workflow appears in /api/workflows list
+    local wfs; wfs=$(curl -fs -H "Authorization: Bearer ${token}" "${base}/workflows")
+    echo "${wfs}" | jq -e --arg id "default:d3a-smoke:${stamp}" '[.workflows[] | select(.workflow_id == $id)] | length == 1' >/dev/null || return 8
+
+    return 0
+}
+
 smoke_tests() {
     step "7/8  Smoke tests"
     # shellcheck disable=SC1091
@@ -1354,6 +1513,10 @@ smoke_tests() {
         "sandbox-isolation|smoke_sandbox_isolation"
         "proxy-tcp-up|bash -c '</dev/tcp/127.0.0.1/${PORT_PROXY_ADMIN}' 2>&1 | grep -qE '^$' || true; (echo > /dev/tcp/127.0.0.1/${PORT_PROXY_ADMIN}) 2>/dev/null"
         "proxy-d1-3-suite|smoke_proxy_d1_3_suite"
+        "bff-health|curl -fs http://localhost:${PORT_BFF}/api/health | jq -e '.status==\"ok\"' >/dev/null"
+        "apisix-401-on-api|[ \$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT_APISIX_PROXY}/api/me) = '401' ]"
+        "apisix-serves-web|curl -fs http://localhost:${PORT_APISIX_PROXY}/ | grep -qE '<title>QA/AQA</title>'"
+        "bff-d3a-suite|smoke_bff_d3a_suite"
     )
     for t in "${tests[@]}"; do
         local name="${t%%|*}"
@@ -1388,6 +1551,10 @@ smoke_tests() {
         echo "  runner-svc    http://localhost:${PORT_RUNNER}     POST /runs"
         echo "  MinIO web     http://localhost:${PORT_MINIO_WEB}     \${MINIO_ROOT_USER} / \${MINIO_ROOT_PASSWORD}"
         echo "  MinIO S3 API  http://localhost:${PORT_MINIO_API}"
+        echo "  APISIX        http://localhost:${PORT_APISIX_PROXY}      front door"
+        echo "  APISIX admin  http://localhost:${PORT_APISIX_ADMIN}      X-API-KEY: ${APISIX_ADMIN_KEY}"
+        echo "  bff           http://localhost:${PORT_BFF}/api/health    direct port (CORS-restricted via APISIX in prod)"
+        echo "  Web UI        http://localhost:${PORT_APISIX_PROXY}/login admin@qa-aqa.local / admin123"
         return 0
     else
         err "${failures} smoke test(s) failed"

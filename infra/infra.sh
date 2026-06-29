@@ -1433,6 +1433,73 @@ JSON
     return 0
 }
 
+smoke_bff_d3c_suite() {
+    # D3c — execute-tests via BFF + media proxy.
+    local base="http://localhost:${PORT_APISIX_PROXY}/api"
+    local login_body
+    login_body=$(curl -fs -X POST -H 'Content-Type: application/json' "${base}/auth/login" \
+        -d '{"email":"reviewer@qa-aqa.local","password":"reviewer123"}') || return 1
+    local token; token=$(echo "${login_body}" | jq -r '.access_token')
+
+    # 1) Seed a test_case directly
+    local stamp; stamp="d3c-$(date +%s)-$$"
+    local tc_id="test_case:${stamp}"
+    curl -fs -H 'X-Tenant-ID: default' -H 'Content-Type: application/json' \
+        -X POST "http://localhost:${PORT_ARTEFACT}/artefacts" \
+        -d "{\"id\":\"${tc_id}\",\"type\":\"test_case\",\"payload\":{\"title\":\"d3c\",\"steps\":[{\"library\":\"playwright\",\"keyword\":\"goto\",\"args\":[\"https://example.com\"]},{\"library\":\"playwright\",\"keyword\":\"screenshot\",\"args\":[\"x\"]}],\"expected_result\":\"loaded\",\"traceability_to_requirement\":\"smoke\"},\"actor\":\"urn:qa-aqa:user:smoke\"}" >/dev/null || return 2
+
+    # 2) Start execute-tests via BFF (sandbox mode)
+    local body
+    body=$(cat <<JSON
+{"test_case_ids":["${tc_id}"],"mode":"playwright_sandbox","target_url":"https://example.com","sandbox_timeout_seconds":60,"allowed_urls":["https://example.com/*","http://example.com/*"]}
+JSON
+)
+    local start_resp
+    start_resp=$(curl -fs -H "Authorization: Bearer ${token}" -H 'Content-Type: application/json' \
+        -X POST "${base}/workflows/execute-tests" -d "${body}") || return 3
+    local wf_id; wf_id=$(echo "${start_resp}" | jq -r '.workflow_id')
+    [[ "${wf_id}" == default:execute-tests:* ]] || return 4
+
+    # 3) Poll status until COMPLETED (max 5 min — sandbox cold start)
+    local elapsed=0 status="RUNNING"
+    while (( elapsed < 300 )); do
+        local sresp
+        sresp=$(curl -fs -H "Authorization: Bearer ${token}" \
+            "${base}/workflow-status/$(printf %s "${wf_id}" | jq -sRr @uri)") || return 5
+        status=$(echo "${sresp}" | jq -r '.status')
+        [[ "${status}" == "COMPLETED" || "${status}" == "FAILED" ]] && break
+        sleep 5; elapsed=$((elapsed + 5))
+    done
+    [[ "${status}" == "COMPLETED" ]] || return 6
+
+    # 4) Verify execution_result has screenshots[]
+    local wf_detail
+    wf_detail=$(curl -fs -H "Authorization: Bearer ${token}" \
+        "${base}/workflows/$(printf %s "${wf_id}" | jq -sRr @uri)")
+    local first_er_screenshots
+    first_er_screenshots=$(echo "${wf_detail}" | jq -r '.artefacts_by_type.execution_result[0].payload.screenshots // []')
+    local first_screenshot
+    first_screenshot=$(echo "${first_er_screenshots}" | jq -r '.[0] // empty')
+    [[ -n "${first_screenshot}" ]] || return 7
+
+    # 5) Strip s3://bucket/ prefix to get the key, then fetch via BFF media proxy
+    local key; key=$(echo "${first_screenshot}" | sed 's|^s3://[^/]*/||')
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer ${token}" \
+        "${base}/media?key=$(printf %s "${key}" | jq -sRr @uri)")
+    [[ "${code}" == "200" ]] || return 8
+
+    # 6) Cross-tenant scope check: key under another tenant should 403
+    local cross
+    cross=$(curl -s -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer ${token}" \
+        "${base}/media?key=$(printf %s "executions/another-tenant/foo.png" | jq -sRr @uri)")
+    [[ "${cross}" == "403" ]] || return 9
+
+    return 0
+}
+
 smoke_bff_d3b_suite() {
     # D3b end-to-end: start design-tests via BFF -> poll status -> verify test_cases.
     local base="http://localhost:${PORT_APISIX_PROXY}/api"
@@ -1569,6 +1636,8 @@ smoke_tests() {
         "bff-d3a-suite|smoke_bff_d3a_suite"
         "bff-designer-needs-role|[ \$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:${PORT_APISIX_PROXY}/api/workflows/design-tests) = '401' ]"
         "bff-d3b-suite|smoke_bff_d3b_suite"
+        "bff-media-401|[ \$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT_APISIX_PROXY}/api/media?key=executions/default/x) = '401' ]"
+        "bff-d3c-suite|smoke_bff_d3c_suite"
     )
     for t in "${tests[@]}"; do
         local name="${t%%|*}"

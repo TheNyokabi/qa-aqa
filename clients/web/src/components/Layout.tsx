@@ -34,6 +34,15 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               >
                 Designer
               </Link>
+              <Link
+                to="/monitor"
+                className={
+                  "hover:text-white " +
+                  (isActive("/monitor") ? "text-white font-medium" : "text-slate-400")
+                }
+              >
+                Monitor
+              </Link>
             </nav>
           </div>
           <div className="flex items-center gap-3 text-sm">

@@ -79,6 +79,38 @@ export function useTransition(artefactId: string) {
   });
 }
 
+// D3c — Executor
+
+export type ExecuteMode = "simulate" | "scripts" | "playwright_sandbox";
+
+export type ExecuteTestsRequest = {
+  test_case_ids: string[];
+  mode: ExecuteMode;
+  target_url?: string;
+  allowed_urls?: string[];
+  sandbox_timeout_seconds?: number;
+  language?: "playwright" | "robot";
+  criticality?: "low" | "medium" | "high" | "safety_critical";
+};
+
+export function useStartExecuteTests() {
+  return useMutation({
+    mutationFn: (body: ExecuteTestsRequest) =>
+      api<{ workflow_id: string }>("/api/workflows/execute-tests", {
+        method: "POST",
+        json: body,
+      }),
+  });
+}
+
+// Convert MinIO s3://bucket/key URLs to BFF media proxy paths.
+export function mediaUrl(s3Url: string | undefined): string | null {
+  if (!s3Url) return null;
+  const m = /^s3:\/\/[^/]+\/(.+)$/.exec(s3Url);
+  if (!m) return null;
+  return `/api/media?key=${encodeURIComponent(m[1])}`;
+}
+
 // D3b — Designer wizard
 
 export type DesignTestsRequest = {

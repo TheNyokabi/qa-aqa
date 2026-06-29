@@ -5,6 +5,7 @@ import WorkflowsListPage from "./pages/WorkflowsListPage";
 import WorkflowDetailPage from "./pages/WorkflowDetailPage";
 import DesignerPage from "./pages/DesignerPage";
 import WorkflowRunPage from "./pages/WorkflowRunPage";
+import MonitorPage from "./pages/MonitorPage";
 import Layout from "./components/Layout";
 
 function Protected({ children }: { children: React.ReactNode }) {
@@ -23,6 +24,7 @@ export default function App() {
       <Route path="/workflows/*" element={<Protected><WorkflowDetailPage /></Protected>} />
       <Route path="/designer" element={<Protected><DesignerPage /></Protected>} />
       <Route path="/run/*" element={<Protected><WorkflowRunPage /></Protected>} />
+      <Route path="/monitor" element={<Protected><MonitorPage /></Protected>} />
     </Routes>
   );
 }

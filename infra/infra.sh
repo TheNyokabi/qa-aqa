@@ -632,6 +632,10 @@ services:
   ollama:
     image: ${IMG_OLLAMA}
     container_name: ollama
+    environment:
+      # Keep loaded models in memory for 24h after last use so the next
+      # workflow doesn't pay a cold-start tax of ~30-60s + degraded inference.
+      - OLLAMA_KEEP_ALIVE=24h
     volumes:
       - ollama-data:/root/.ollama
     ports:
@@ -1429,6 +1433,52 @@ JSON
     return 0
 }
 
+smoke_bff_d3b_suite() {
+    # D3b end-to-end: start design-tests via BFF -> poll status -> verify test_cases.
+    local base="http://localhost:${PORT_APISIX_PROXY}/api"
+    local login_body
+    login_body=$(curl -fs -X POST -H 'Content-Type: application/json' "${base}/auth/login" \
+        -d '{"email":"reviewer@qa-aqa.local","password":"reviewer123"}') || return 1
+    local token; token=$(echo "${login_body}" | jq -r '.access_token')
+
+    local stamp; stamp=$(date +%s)
+    local body
+    body=$(cat <<JSON
+{"requirement":{"id":"R-d3b-${stamp}","title":"d3b login","acceptance_criteria":["valid creds return 200","invalid creds return 401"]},"criticality":"low"}
+JSON
+)
+    local start_resp
+    start_resp=$(curl -fs -H "Authorization: Bearer ${token}" -H 'Content-Type: application/json' \
+        -X POST "${base}/workflows/design-tests" -d "${body}") || return 2
+    local wf_id; wf_id=$(echo "${start_resp}" | jq -r '.workflow_id')
+    [[ "${wf_id}" == default:design-tests:* ]] || return 3
+
+    # Poll status until terminal (max 10 min — LLM cold start can be slow)
+    local elapsed=0
+    local status="RUNNING"
+    while (( elapsed < 600 )); do
+        local sresp
+        sresp=$(curl -fs -H "Authorization: Bearer ${token}" \
+            "${base}/workflow-status/$(printf %s "${wf_id}" | jq -sRr @uri)") || return 4
+        status=$(echo "${sresp}" | jq -r '.status')
+        [[ "${status}" == "COMPLETED" || "${status}" == "FAILED" ]] && break
+        sleep 5; elapsed=$((elapsed + 5))
+    done
+    [[ "${status}" == "COMPLETED" ]] || return 5
+
+    # Verify test_cases via /api/workflows/{id}
+    local wf_detail
+    wf_detail=$(curl -fs -H "Authorization: Bearer ${token}" \
+        "${base}/workflows/$(printf %s "${wf_id}" | jq -sRr @uri)")
+    local tc_count
+    tc_count=$(echo "${wf_detail}" | jq '.artefacts_by_type.test_case | length // 0')
+    (( tc_count >= 1 )) || return 6
+    local parent
+    parent=$(echo "${wf_detail}" | jq -r '.artefacts_by_type.test_case[0].parent_id')
+    echo "${parent}" | grep -qE '^requirement:' || return 7
+    return 0
+}
+
 smoke_bff_d3a_suite() {
     # D3a end-to-end: login -> list workflows -> transition an artefact.
     local base="http://localhost:${PORT_APISIX_PROXY}/api"
@@ -1517,6 +1567,8 @@ smoke_tests() {
         "apisix-401-on-api|[ \$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT_APISIX_PROXY}/api/me) = '401' ]"
         "apisix-serves-web|curl -fs http://localhost:${PORT_APISIX_PROXY}/ | grep -qE '<title>QA/AQA</title>'"
         "bff-d3a-suite|smoke_bff_d3a_suite"
+        "bff-designer-needs-role|[ \$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:${PORT_APISIX_PROXY}/api/workflows/design-tests) = '401' ]"
+        "bff-d3b-suite|smoke_bff_d3b_suite"
     )
     for t in "${tests[@]}"; do
         local name="${t%%|*}"

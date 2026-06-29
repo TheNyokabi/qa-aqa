@@ -23,6 +23,17 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               >
                 Workflows
               </Link>
+              <Link
+                to="/designer"
+                className={
+                  "hover:text-white " +
+                  (isActive("/designer") || isActive("/run")
+                    ? "text-white font-medium"
+                    : "text-slate-400")
+                }
+              >
+                Designer
+              </Link>
             </nav>
           </div>
           <div className="flex items-center gap-3 text-sm">

@@ -3,6 +3,8 @@ import { useAuth } from "./lib/auth";
 import LoginPage from "./pages/LoginPage";
 import WorkflowsListPage from "./pages/WorkflowsListPage";
 import WorkflowDetailPage from "./pages/WorkflowDetailPage";
+import DesignerPage from "./pages/DesignerPage";
+import WorkflowRunPage from "./pages/WorkflowRunPage";
 import Layout from "./components/Layout";
 
 function Protected({ children }: { children: React.ReactNode }) {
@@ -19,6 +21,8 @@ export default function App() {
       <Route path="/" element={<Protected><Navigate to="/workflows" replace /></Protected>} />
       <Route path="/workflows" element={<Protected><WorkflowsListPage /></Protected>} />
       <Route path="/workflows/*" element={<Protected><WorkflowDetailPage /></Protected>} />
+      <Route path="/designer" element={<Protected><DesignerPage /></Protected>} />
+      <Route path="/run/*" element={<Protected><WorkflowRunPage /></Protected>} />
     </Routes>
   );
 }

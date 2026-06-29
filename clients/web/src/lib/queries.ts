@@ -78,3 +78,47 @@ export function useTransition(artefactId: string) {
     },
   });
 }
+
+// D3b — Designer wizard
+
+export type DesignTestsRequest = {
+  requirement: {
+    id?: string;
+    title: string;
+    acceptance_criteria: string[];
+    [k: string]: unknown;
+  };
+  criticality: "low" | "medium" | "high" | "safety_critical";
+};
+
+export type WorkflowStatus = {
+  workflow_id: string;
+  status: "RUNNING" | "COMPLETED" | "FAILED" | "CANCELED" | "TERMINATED" | "TIMED_OUT" | "UNKNOWN";
+  start_time: string | null;
+  close_time: string | null;
+  result?: Record<string, unknown>;
+  result_error?: string;
+};
+
+export function useStartDesignTests() {
+  return useMutation({
+    mutationFn: (body: DesignTestsRequest) =>
+      api<{ workflow_id: string }>("/api/workflows/design-tests", {
+        method: "POST",
+        json: body,
+      }),
+  });
+}
+
+export function useWorkflowStatus(id: string | undefined) {
+  return useQuery({
+    enabled: !!id,
+    queryKey: ["wf-status", id],
+    queryFn: () =>
+      api<WorkflowStatus>(`/api/workflow-status/${encodeURIComponent(id!)}`),
+    refetchInterval: (q) => {
+      const s = (q.state.data as WorkflowStatus | undefined)?.status;
+      return s && s !== "RUNNING" ? false : 3_000;
+    },
+  });
+}

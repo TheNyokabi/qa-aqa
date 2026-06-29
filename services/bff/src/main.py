@@ -23,7 +23,7 @@ from pydantic import BaseModel
 
 from . import config
 from .auth import User, create_token, load_users, verify_password
-from .clients import artefact
+from .clients import artefact, temporal as temporal_client
 from .deps import current_user, require_role
 
 
@@ -55,6 +55,11 @@ class LoginResponse(BaseModel):
 
 class TransitionRequest(BaseModel):
     to_state: str
+
+
+class DesignTestsRequest(BaseModel):
+    requirement: dict[str, Any]
+    criticality: str = "low"
 
 
 @app.get("/api/health")
@@ -154,3 +159,34 @@ async def artefact_transition(
 @app.get("/api/policies/approval/{target_type}")
 async def approval_policy(target_type: str, user: User = Depends(current_user)) -> dict[str, Any]:
     return await artefact.approval_policy(user.tenant_id, target_type)
+
+
+# ── D3b — Designer wizard ────────────────────────────────────────────────────
+
+
+@app.post("/api/workflows/design-tests")
+async def start_design_tests(
+    body: DesignTestsRequest,
+    user: User = Depends(require_role("reviewer")),
+) -> dict[str, str]:
+    import uuid
+    wf_id = f"{user.tenant_id}:design-tests:{uuid.uuid4().hex[:12]}"
+    req = {
+        **body.requirement,
+        "criticality": body.criticality,
+    }
+    actual_id = await temporal_client.start_design_tests(wf_id, req)
+    return {"workflow_id": actual_id}
+
+
+@app.get("/api/workflow-status/{wf_id:path}")
+async def workflow_status(
+    wf_id: str,
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    # NB: path is /workflow-status/ (not /workflows/status/) because FastAPI's
+    # /api/workflows/{wf_id:path} from D3a would otherwise shadow this route
+    # — it'd match `status/<id>` as the wf_id wildcard.
+    if not wf_id.startswith(f"{user.tenant_id}:"):
+        raise HTTPException(status_code=403, detail="cross-tenant workflow access denied")
+    return await temporal_client.workflow_status(wf_id)

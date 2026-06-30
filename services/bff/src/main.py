@@ -13,6 +13,7 @@ D3a:
 """
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -85,9 +86,31 @@ async def login(req: LoginRequest) -> LoginResponse:
     return LoginResponse(access_token=create_token(user), user=user)
 
 
-@app.get("/api/me", response_model=User)
-async def me(user: User = Depends(current_user)) -> User:
-    return user
+@app.get("/api/me")
+async def me(user: User = Depends(current_user)) -> dict[str, Any]:
+    """Returns user identity + live quota status for the caller's tenant.
+
+    D1.4a — quota is fetched from runner-service /quota/{tenant_id}. Failure
+    to reach runner is non-fatal — we just omit the quota field.
+    """
+    out: dict[str, Any] = {
+        "email": user.email,
+        "role": user.role,
+        "urn": user.urn,
+        "tenant_id": user.tenant_id,
+    }
+    try:
+        runner_url = config.__dict__.get(
+            "RUNNER_URL",
+            os.environ.get("RUNNER_URL", "http://runner-service:8004"),
+        )
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.get(f"{runner_url}/quota/{user.tenant_id}")
+            if r.status_code == 200:
+                out["quota"] = r.json()
+    except Exception:
+        pass
+    return out
 
 
 @app.get("/api/workflows")

@@ -1,5 +1,29 @@
 import { Link, useLocation } from "react-router-dom";
 import { useAuth } from "../lib/auth";
+import { useQuota } from "../lib/queries";
+
+function QuotaBadge() {
+  const { data } = useQuota();
+  const q = data?.quota;
+  if (!q) return null;
+  const c = q.concurrent;
+  const d = q.daily;
+  const concurrentNear = c.current >= c.max * 0.8;
+  const dailyNear = d.current >= d.max * 0.8;
+  const concurrentCls = concurrentNear ? "text-amber-300" : "text-slate-400";
+  const dailyCls = dailyNear ? "text-amber-300" : "text-slate-400";
+  return (
+    <div className="hidden md:flex items-center gap-3 text-xs">
+      <span className={concurrentCls} title="Concurrent sandbox runs for your tenant">
+        running <span className="font-mono">{c.current}/{c.max}</span>
+      </span>
+      <span className="text-slate-700">·</span>
+      <span className={dailyCls} title="Submitted today (resets at UTC midnight)">
+        today <span className="font-mono">{d.current}/{d.max}</span>
+      </span>
+    </div>
+  );
+}
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   const { user, logout } = useAuth();
@@ -46,6 +70,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             </nav>
           </div>
           <div className="flex items-center gap-3 text-sm">
+            <QuotaBadge />
             <span className="text-slate-400">{user?.email}</span>
             <span className="px-2 py-0.5 rounded bg-slate-800 text-xs uppercase tracking-wider">
               {user?.role}

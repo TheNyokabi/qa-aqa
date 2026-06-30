@@ -19,7 +19,8 @@ RUN pip3 install --no-cache-dir \
     "fastapi==0.115.4" \
     "uvicorn[standard]==0.32.0" \
     "pydantic==2.9.2" \
-    "minio==7.2.10"
+    "minio==7.2.10" \
+    "valkey==6.0.2"
 
 COPY src /app/src
 

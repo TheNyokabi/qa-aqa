@@ -1,11 +1,17 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { api, getToken, setToken } from "./api";
 
+export type Quota = {
+  concurrent: { current: number; max: number };
+  daily: { current: number; max: number; resets_at: string };
+};
+
 export type User = {
   email: string;
   role: "viewer" | "reviewer" | "admin";
   urn: string;
   tenant_id: string;
+  quota?: Quota;
 };
 
 type AuthCtx = {

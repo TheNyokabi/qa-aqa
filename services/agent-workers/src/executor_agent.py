@@ -157,6 +157,11 @@ async def run_in_sandbox(
     test_case_id: str,
     allowed_urls: list[str] | None = None,
 ) -> dict[str, Any]:
+    """D1.4b — runner-service /runs is async: POST returns 202+run_id,
+    we then poll /runs/{id} until terminal. The Temporal heartbeat ticker
+    around the activity keeps things alive during the poll."""
+    import asyncio as _asyncio
+
     body = {
         "test_case": test_case,
         "target_url": target_url,
@@ -166,8 +171,66 @@ async def run_in_sandbox(
         "test_case_id": test_case_id,
         "allowed_urls": allowed_urls or [],
     }
-    r = await client.post(f"{config.RUNNER_URL}/runs", json=body, timeout=httpx.Timeout(timeout_seconds + 60))
+    r = await client.post(f"{config.RUNNER_URL}/runs", json=body, timeout=30.0)
+    if r.status_code == 429:
+        # Quota exceeded — return as a structured error result the workflow
+        # can persist. Don't raise: this is a deterministic outcome, not a
+        # transient failure to retry.
+        return {
+            "mode": "playwright_sandbox",
+            "status": "error",
+            "error_message": f"quota exceeded: {r.text}",
+            "screenshots": [],
+            "videos": [],
+            "console_log_url": "",
+            "duration_ms": 0,
+        }
     r.raise_for_status()
-    out = r.json()
-    out.setdefault("mode", "playwright_sandbox")
-    return out
+    run_id = r.json()["run_id"]
+
+    # Poll. Overall budget is timeout_seconds + 60s (covers cold start, queue wait).
+    deadline = timeout_seconds + 60
+    elapsed = 0
+    poll_interval = 2.0
+    while elapsed < deadline:
+        await _asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+        s = await client.get(f"{config.RUNNER_URL}/runs/{run_id}", timeout=30.0)
+        if s.status_code == 404:
+            return {
+                "mode": "playwright_sandbox",
+                "status": "error",
+                "error_message": f"run {run_id} disappeared (expired or never queued)",
+                "screenshots": [],
+                "videos": [],
+                "console_log_url": "",
+                "duration_ms": 0,
+            }
+        s.raise_for_status()
+        state = s.json()
+        status = state.get("status")
+        if status in ("completed", "failed"):
+            result = state.get("result") or {}
+            if status == "failed" and not result:
+                return {
+                    "mode": "playwright_sandbox",
+                    "status": "error",
+                    "error_message": state.get("error", "run failed"),
+                    "screenshots": [],
+                    "videos": [],
+                    "console_log_url": "",
+                    "duration_ms": 0,
+                }
+            result.setdefault("mode", "playwright_sandbox")
+            return result
+    # Polling timed out — return a synthetic timeout result. The actual sandbox
+    # might still be running; the workflow gets a clear signal.
+    return {
+        "mode": "playwright_sandbox",
+        "status": "timeout",
+        "error_message": f"runner-service poll timed out after {deadline}s for run {run_id}",
+        "screenshots": [],
+        "videos": [],
+        "console_log_url": "",
+        "duration_ms": deadline * 1000,
+    }

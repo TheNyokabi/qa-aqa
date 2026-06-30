@@ -36,6 +36,26 @@ export type HistoryEntry = {
   attestation: Record<string, unknown>;
 };
 
+// D1.4 — live quota for the current tenant (refreshes every 5s)
+export type QuotaStatus = {
+  email: string;
+  role: string;
+  urn: string;
+  tenant_id: string;
+  quota?: {
+    concurrent: { current: number; max: number };
+    daily: { current: number; max: number; resets_at: string };
+  };
+};
+
+export function useQuota() {
+  return useQuery({
+    queryKey: ["me-quota"],
+    queryFn: () => api<QuotaStatus>("/api/me"),
+    refetchInterval: 5_000,
+  });
+}
+
 export function useWorkflows() {
   return useQuery({
     queryKey: ["workflows"],

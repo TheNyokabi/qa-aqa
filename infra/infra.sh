@@ -872,10 +872,16 @@ services:
       - MITM_CA_DIR=/mitm-ca
       - PROXY_ALLOWLIST_HOST_DIR=/tmp/proxy-allowlists
       - PROXY_ALLOWLIST_DIR=/proxy-allowlists
+      # D1.4 — async queue + per-tenant quotas
+      - VALKEY_URL=redis://valkey:6379
+      - QUOTA_CONCURRENT_DEFAULT=3
+      - QUOTA_DAILY_DEFAULT=100
     depends_on:
       minio:
         condition: service_healthy
       proxy-service:
+        condition: service_healthy
+      valkey:
         condition: service_healthy
     ports:
       - "${PORT_RUNNER}:8004"
@@ -1433,6 +1439,82 @@ JSON
     return 0
 }
 
+smoke_runner_d1_4_suite() {
+    # D1.4 — async queue + per-tenant quotas via runner-service direct API.
+    local base="http://localhost:${PORT_RUNNER}"
+    local stamp="d14-$(date +%s)-$$"
+
+    # 1) POST /runs returns 202 + run_id + status=queued
+    local body
+    body=$(cat <<JSON
+{"test_case":{"payload":{"title":"d14 a","steps":[{"library":"playwright","keyword":"goto","args":["https://example.com"]},{"library":"playwright","keyword":"screenshot","args":["x"]}],"expected_result":"loaded","traceability_to_requirement":"smoke"}},"target_url":"https://example.com","timeout_seconds":60,"tenant_id":"default","workflow_id":"smoke:d14:${stamp}","test_case_id":"smoke-tc-1","allowed_urls":["https://example.com/*","http://example.com/*"]}
+JSON
+)
+    local r1
+    r1=$(curl -fs -o /tmp/d14_a.json -w '%{http_code}' -X POST "${base}/runs" \
+        -H 'Content-Type: application/json' -d "${body}")
+    [[ "${r1}" == "202" ]] || return 1
+    local run_id; run_id=$(jq -r '.run_id' /tmp/d14_a.json)
+    local status; status=$(jq -r '.status' /tmp/d14_a.json)
+    [[ -n "${run_id}" && "${status}" == "queued" ]] || return 2
+
+    # 2) Poll GET /runs/{id} until terminal
+    local elapsed=0
+    local final="queued"
+    while (( elapsed < 240 )); do
+        sleep 3; elapsed=$((elapsed + 3))
+        final=$(curl -fs "${base}/runs/${run_id}" | jq -r '.status' || echo "?")
+        [[ "${final}" == "completed" || "${final}" == "failed" ]] && break
+    done
+    [[ "${final}" == "completed" ]] || return 3
+
+    # 3) Quota endpoint returns the expected shape
+    local q; q=$(curl -fs "${base}/quota/default")
+    echo "${q}" | jq -e '.concurrent.max == 3 and .daily.max == 100' >/dev/null || return 4
+
+    return 0
+}
+
+smoke_runner_d1_4_quota_concurrent() {
+    # Submit 4 runs rapid-fire; the 4th MUST be 429 with kind=quota_concurrent.
+    # Use a deliberately long timeout so the first 3 stay running while we
+    # submit the 4th.
+    local base="http://localhost:${PORT_RUNNER}"
+    local stamp="d14q-$(date +%s)-$$"
+    local tenant="quota-test-${stamp}"  # fresh tenant so we don't tangle with other smokes
+    # Body factory — long timeout, but the runs themselves won't even start
+    # in time because the queue worker processes serially.
+    _post() {
+        local i="$1"
+        local body
+        body=$(cat <<JSON
+{"test_case":{"payload":{"title":"q ${i}","steps":[{"library":"playwright","keyword":"goto","args":["https://example.com"]},{"library":"playwright","keyword":"screenshot","args":["x"]}],"expected_result":"loaded","traceability_to_requirement":"smoke"}},"target_url":"https://example.com","timeout_seconds":300,"tenant_id":"${tenant}","workflow_id":"smoke:q:${stamp}:${i}","test_case_id":"smoke-tc-${i}","allowed_urls":["https://example.com/*"]}
+JSON
+)
+        curl -s -o /tmp/d14q_${i}.json -w '%{http_code}' -X POST "${base}/runs" \
+            -H 'Content-Type: application/json' -d "${body}"
+    }
+    local c1 c2 c3 c4
+    c1=$(_post 1); c2=$(_post 2); c3=$(_post 3); c4=$(_post 4)
+    [[ "${c1}" == "202" && "${c2}" == "202" && "${c3}" == "202" ]] || return 1
+    [[ "${c4}" == "429" ]] || return 2
+    # Body of 4th must indicate quota_concurrent
+    jq -e '.detail.kind == "quota_concurrent"' /tmp/d14q_4.json >/dev/null || return 3
+    return 0
+}
+
+smoke_bff_quota_in_me() {
+    # BFF /api/me includes quota.concurrent + quota.daily for the caller's tenant.
+    local base="http://localhost:${PORT_APISIX_PROXY}/api"
+    local login_body
+    login_body=$(curl -fs -X POST -H 'Content-Type: application/json' "${base}/auth/login" \
+        -d '{"email":"reviewer@qa-aqa.local","password":"reviewer123"}') || return 1
+    local token; token=$(echo "${login_body}" | jq -r '.access_token')
+    local me; me=$(curl -fs -H "Authorization: Bearer ${token}" "${base}/me")
+    echo "${me}" | jq -e '.quota.concurrent.max == 3 and .quota.daily.max == 100' >/dev/null || return 2
+    return 0
+}
+
 smoke_bff_d3c_suite() {
     # D3c — execute-tests via BFF + media proxy.
     local base="http://localhost:${PORT_APISIX_PROXY}/api"
@@ -1638,6 +1720,9 @@ smoke_tests() {
         "bff-d3b-suite|smoke_bff_d3b_suite"
         "bff-media-401|[ \$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT_APISIX_PROXY}/api/media?key=executions/default/x) = '401' ]"
         "bff-d3c-suite|smoke_bff_d3c_suite"
+        "runner-d1-4-suite|smoke_runner_d1_4_suite"
+        "runner-quota-concurrent|smoke_runner_d1_4_quota_concurrent"
+        "bff-quota-in-me|smoke_bff_quota_in_me"
     )
     for t in "${tests[@]}"; do
         local name="${t%%|*}"

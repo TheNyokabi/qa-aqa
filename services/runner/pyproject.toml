@@ -1,7 +1,7 @@
 [project]
 name = "runner-service"
-version = "0.1.0"
-description = "Playwright executor for QA/AQA. Runs translated test_case scripts in-process; uploads artefacts to MinIO."
+version = "0.2.0"
+description = "Playwright executor for QA/AQA. Async runs queue + per-tenant quotas (Valkey-backed). Spawns ephemeral sandbox containers per /runs call."
 requires-python = ">=3.12"
 dependencies = [
     "fastapi==0.115.4",
@@ -9,4 +9,5 @@ dependencies = [
     "pydantic==2.9.2",
     "playwright==1.48.0",
     "minio==7.2.10",
+    "valkey==6.0.2",
 ]

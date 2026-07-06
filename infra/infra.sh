@@ -1503,6 +1503,54 @@ JSON
     return 0
 }
 
+smoke_runner_cancel_queued() {
+  # Concurrent slot is reserved at submit (D1.4 semantics). Concurrent cap is 3,
+  # so we submit 2 long-running playwright fillers to occupy the worker, then a
+  # 3rd "target" that lands behind them in runs:queue. Cancel the target while
+  # it is still queued.
+  local TENANT="smk-cancel-q-$RANDOM"
+  local _post_run
+  _post_run() {
+    local role="$1"
+    curl -fsS -X POST http://localhost:8004/runs -H 'Content-Type: application/json' -d "$(cat <<JSON
+{"tenant_id":"$TENANT","workflow_id":"smoke:cancel-q","test_case_id":"$role",
+ "test_case":{"payload":{"title":"$role","steps":[
+   {"library":"playwright","keyword":"goto","args":["https://example.com"]},
+   {"library":"playwright","keyword":"screenshot","args":["x"]}],
+   "expected_result":"loaded","traceability_to_requirement":"smoke"}},
+ "target_url":"https://example.com","timeout_seconds":300,
+ "allowed_urls":["https://example.com/*"]}
+JSON
+)" | jq -r .run_id
+  }
+  local f1 f2 target
+  f1=$(_post_run filler-1) || return 1
+  [[ -n "$f1" && "$f1" != "null" ]] || { echo "filler-1 submit failed: rid='$f1'"; return 1; }
+  f2=$(_post_run filler-2) || return 1
+  [[ -n "$f2" && "$f2" != "null" ]] || { echo "filler-2 submit failed: rid='$f2'"; return 1; }
+  target=$(_post_run target) || return 1
+  [[ -n "$target" && "$target" != "null" ]] || { echo "target submit failed: rid='$target'"; return 1; }
+  # Target must currently be queued (worker is busy with filler-1's sandbox).
+  local tst
+  tst=$(curl -fsS "http://localhost:8004/runs/$target" | jq -r .status)
+  [[ "$tst" == "queued" ]] || { echo "target not queued, status=$tst"; return 1; }
+  # Cancel the queued target.
+  local code
+  code=$(curl -s -o /tmp/cancel_q.out -w '%{http_code}' \
+    -X POST "http://localhost:8004/runs/$target/cancel" \
+    -H 'Content-Type: application/json' \
+    -d "{\"actor_urn\":\"urn:qa-aqa:user:smoke\",\"tenant_id\":\"$TENANT\"}")
+  [[ "$code" == "200" ]] || { echo "expected 200, got $code body=$(cat /tmp/cancel_q.out)"; return 1; }
+  # Status must be canceled.
+  local status
+  status=$(curl -fsS "http://localhost:8004/runs/$target" | jq -r .status)
+  [[ "$status" == "canceled" ]] || { echo "expected status=canceled, got $status"; return 1; }
+  # tenant:running must NOT contain the canceled target (slot released).
+  local in_set
+  in_set=$(podman exec valkey valkey-cli SISMEMBER "tenant:$TENANT:running" "$target")
+  [[ "$in_set" == "0" ]] || { echo "tenant:running still contains $target"; return 1; }
+}
+
 smoke_bff_quota_in_me() {
     # BFF /api/me includes quota.concurrent + quota.daily for the caller's tenant.
     local base="http://localhost:${PORT_APISIX_PROXY}/api"
@@ -1723,6 +1771,7 @@ smoke_tests() {
         "runner-d1-4-suite|smoke_runner_d1_4_suite"
         "runner-quota-concurrent|smoke_runner_d1_4_quota_concurrent"
         "bff-quota-in-me|smoke_bff_quota_in_me"
+        "runner-cancel-queued|smoke_runner_cancel_queued"
     )
     for t in "${tests[@]}"; do
         local name="${t%%|*}"

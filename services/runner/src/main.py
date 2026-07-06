@@ -116,6 +116,34 @@ async def get_quota(tenant_id: str) -> dict[str, Any]:
     return await _q.quota_status(tenant_id)
 
 
+class CancelRequest(BaseModel):
+    actor_urn: str
+    tenant_id: str
+
+
+@app.post("/runs/{run_id}/cancel")
+async def cancel_run(run_id: str, body: CancelRequest) -> dict[str, Any]:
+    state = await _q.get(run_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    current_status = state.get("status", "")
+    if current_status == "queued":
+        r = await _q.cancel_queued(run_id, body.actor_urn, body.tenant_id)
+        if r.code == 3:
+            raise HTTPException(status_code=404, detail="run not found")
+        if r.code == 1:
+            raise HTTPException(status_code=403, detail="cross-tenant cancel forbidden")
+        if r.code == 2:
+            raise HTTPException(status_code=409,
+                                detail={"detail": "run already terminal", "status": r.previous_status})
+        return {"run_id": run_id, "status": "canceled", "previous_status": r.previous_status}
+    if current_status in ("completed", "failed", "canceled"):
+        raise HTTPException(status_code=409,
+                            detail={"detail": "run already terminal", "status": current_status})
+    # current_status == "running" — implemented in Task 5
+    raise HTTPException(status_code=501, detail="running-cancel not yet implemented")
+
+
 # ── worker loop ──────────────────────────────────────────────────────────────
 async def _worker_loop() -> None:
     """Consume from Valkey queue and execute sandboxes serially.

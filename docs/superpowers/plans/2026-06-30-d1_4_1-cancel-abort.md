@@ -49,29 +49,43 @@ The simplest cancel path: run is still in `runs:queue`, no sandbox to kill.
 
 - [ ] **Step 1: Write failing smoke test**
 
-Append to `infra/infra.sh` near the other `smoke_*` runner tests:
+Append to `infra/infra.sh` near the other `smoke_*` runner tests.
+
+**Plan errata (2026-07-01):** the original design "3 fillers to saturate quota, 4th submit queues" is impossible under shipped D1.4 semantics — concurrent slot is reserved via `SADD tenant:running` at **submit** (spec §4), so a 4th submit against `concurrent=3` returns 429, not a queued run (`smoke_runner_d1_4_quota_concurrent` proves this). Corrected design: 2 long-running playwright fillers occupy the worker; the 3rd "target" fits under the concurrent cap and lands behind them in `runs:queue` because the worker processes serially. Also switched to explicit `[[ -n "$rid" && "$rid" != "null" ]]` guards because `curl -fsS ... | jq -r .run_id` swallows curl failures (jq exits 0 with output `"null"`).
 
 ```bash
 smoke_runner_cancel_queued() {
-  # Saturate quota with long-running fillers so the test run sits in the queue.
+  # Concurrent slot is reserved at submit (D1.4 semantics). Concurrent cap is 3,
+  # so we submit 2 long-running playwright fillers to occupy the worker, then a
+  # 3rd "target" that lands behind them in runs:queue. Cancel the target while
+  # it is still queued.
   local TENANT="smk-cancel-q-$RANDOM"
-  local filler_ids=()
-  local i
-  for i in 1 2 3; do
-    local rid
-    rid=$(curl -fsS -X POST http://localhost:8004/runs -H 'Content-Type: application/json' \
-      -d "{\"tenant_id\":\"$TENANT\",\"workflow_id\":\"wf\",\"test_case_id\":\"tc-$i\",
-           \"test_case\":{\"payload\":{\"title\":\"sleep\",\"steps\":[]}},
-           \"timeout_seconds\":120}" | jq -r .run_id) || return 1
-    filler_ids+=("$rid")
-  done
-  # 4th submit must queue (quota_concurrent=3 reached).
-  local target
-  target=$(curl -fsS -X POST http://localhost:8004/runs -H 'Content-Type: application/json' \
-    -d "{\"tenant_id\":\"$TENANT\",\"workflow_id\":\"wf\",\"test_case_id\":\"target\",
-         \"test_case\":{\"payload\":{\"title\":\"sleep\",\"steps\":[]}},
-         \"timeout_seconds\":120}" | jq -r .run_id) || return 1
-  # Cancel the queued one.
+  local _post_run
+  _post_run() {
+    local role="$1"
+    curl -fsS -X POST http://localhost:8004/runs -H 'Content-Type: application/json' -d "$(cat <<JSON
+{"tenant_id":"$TENANT","workflow_id":"smoke:cancel-q","test_case_id":"$role",
+ "test_case":{"payload":{"title":"$role","steps":[
+   {"library":"playwright","keyword":"goto","args":["https://example.com"]},
+   {"library":"playwright","keyword":"screenshot","args":["x"]}],
+   "expected_result":"loaded","traceability_to_requirement":"smoke"}},
+ "target_url":"https://example.com","timeout_seconds":300,
+ "allowed_urls":["https://example.com/*"]}
+JSON
+)" | jq -r .run_id
+  }
+  local f1 f2 target
+  f1=$(_post_run filler-1) || return 1
+  [[ -n "$f1" && "$f1" != "null" ]] || { echo "filler-1 submit failed: rid='$f1'"; return 1; }
+  f2=$(_post_run filler-2) || return 1
+  [[ -n "$f2" && "$f2" != "null" ]] || { echo "filler-2 submit failed: rid='$f2'"; return 1; }
+  target=$(_post_run target) || return 1
+  [[ -n "$target" && "$target" != "null" ]] || { echo "target submit failed: rid='$target'"; return 1; }
+  # Target must currently be queued (worker is busy with filler-1's sandbox).
+  local tst
+  tst=$(curl -fsS "http://localhost:8004/runs/$target" | jq -r .status)
+  [[ "$tst" == "queued" ]] || { echo "target not queued, status=$tst"; return 1; }
+  # Cancel the queued target.
   local code
   code=$(curl -s -o /tmp/cancel_q.out -w '%{http_code}' \
     -X POST "http://localhost:8004/runs/$target/cancel" \
@@ -82,7 +96,7 @@ smoke_runner_cancel_queued() {
   local status
   status=$(curl -fsS "http://localhost:8004/runs/$target" | jq -r .status)
   [[ "$status" == "canceled" ]] || { echo "expected status=canceled, got $status"; return 1; }
-  # tenant:running must NOT contain the canceled run.
+  # tenant:running must NOT contain the canceled target (slot released).
   local in_set
   in_set=$(podman exec valkey valkey-cli SISMEMBER "tenant:$TENANT:running" "$target")
   [[ "$in_set" == "0" ]] || { echo "tenant:running still contains $target"; return 1; }

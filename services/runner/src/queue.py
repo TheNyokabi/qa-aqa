@@ -72,6 +72,44 @@ return {0, concurrent + 1, new_daily}
 """
 
 
+# Atomic cancel of a queued run. Tenant-checked. Returns:
+#   {0, previous_status} on success (run is now canceled)
+#   {1, stored_tenant}   on cross-tenant attempt (caller -> 403)
+#   {2, current_status}  if status is not "queued" (caller -> 409)
+#   {3, ""}              if run hash does not exist (caller -> 404)
+_LUA_CANCEL_QUEUED = """
+local k_run = KEYS[1]
+local k_queue = KEYS[2]
+local k_processing = KEYS[3]
+local k_running = KEYS[4]
+local run_id = ARGV[1]
+local caller_tenant = ARGV[2]
+local actor_urn = ARGV[3]
+local now = ARGV[4]
+
+if redis.call('EXISTS', k_run) == 0 then
+    return {3, ""}
+end
+local stored_tenant = redis.call('HGET', k_run, 'tenant_id') or ""
+if stored_tenant ~= caller_tenant then
+    return {1, stored_tenant}
+end
+local status = redis.call('HGET', k_run, 'status') or ""
+if status ~= 'queued' then
+    return {2, status}
+end
+redis.call('LREM', k_queue, 0, run_id)
+redis.call('LREM', k_processing, 0, run_id)
+redis.call('SREM', k_running, run_id)
+redis.call('HSET', k_run,
+    'status', 'canceled',
+    'canceled_by', actor_urn,
+    'canceled_at', now,
+    'completed_at', now)
+return {0, status}
+"""
+
+
 class QuotaExceeded(Exception):
     def __init__(self, kind: str, current: int, maximum: int):
         self.kind = kind
@@ -80,15 +118,24 @@ class QuotaExceeded(Exception):
         super().__init__(f"quota_{kind} exceeded: {current}/{maximum}")
 
 
+class CancelResult:
+    def __init__(self, code: int, previous_status: str = "", stored_tenant: str = ""):
+        self.code = code  # 0=ok 1=cross-tenant 2=wrong-status 3=not-found
+        self.previous_status = previous_status
+        self.stored_tenant = stored_tenant
+
+
 class Queue:
     def __init__(self, valkey_url: str = VALKEY_URL):
         self._url = valkey_url
         self._v: Valkey | None = None
         self._reserve_sha: str | None = None
+        self._cancel_queued_sha: str | None = None
 
     async def connect(self) -> None:
         self._v = Valkey.from_url(self._url, decode_responses=True)
         self._reserve_sha = await self._v.script_load(_LUA_RESERVE)
+        self._cancel_queued_sha = await self._v.script_load(_LUA_CANCEL_QUEUED)
 
     async def close(self) -> None:
         if self._v:
@@ -118,6 +165,27 @@ class Queue:
     async def release(self, tenant_id: str, run_id: str) -> None:
         assert self._v is not None
         await self._v.srem(k_running(tenant_id), run_id)
+
+    async def cancel_queued(self, run_id: str, actor_urn: str, caller_tenant: str) -> CancelResult:
+        assert self._v is not None and self._cancel_queued_sha is not None
+        now = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+        result = await self._v.evalsha(
+            self._cancel_queued_sha,
+            4,
+            k_run(run_id),
+            K_QUEUE,
+            K_PROCESSING,
+            k_running(caller_tenant),
+            run_id, caller_tenant, actor_urn, now,
+        )
+        code = int(result[0])
+        if code == 0:
+            return CancelResult(0, previous_status=str(result[1]))
+        if code == 1:
+            return CancelResult(1, stored_tenant=str(result[1]))
+        if code == 2:
+            return CancelResult(2, previous_status=str(result[1]))
+        return CancelResult(3)
 
     async def submit(self, tenant_id: str, request: dict[str, Any]) -> str:
         assert self._v is not None

@@ -1551,6 +1551,82 @@ JSON
   [[ "$in_set" == "0" ]] || { echo "tenant:running still contains $target"; return 1; }
 }
 
+smoke_runner_cancel_cross_tenant() {
+  # Tenant A holds a long-running filler that occupies the worker; tenant A
+  # submits a target that queues behind the filler; tenant B attempts to cancel
+  # the target -> 403. We deliberately verify while the target is queued so the
+  # tenant check in cancel_queued Lua fires (the endpoint's terminal/running
+  # dispatch branches don't currently tenant-check -- tracked separately).
+  local TA="smk-xtA-$RANDOM"
+  local TB="smk-xtB-$RANDOM"
+  local _post_run
+  _post_run() {
+    local tenant="$1" role="$2"
+    curl -fsS -X POST http://localhost:8004/runs -H 'Content-Type: application/json' -d "$(cat <<JSON
+{"tenant_id":"$tenant","workflow_id":"smoke:cancel-xt","test_case_id":"$role",
+ "test_case":{"payload":{"title":"$role","steps":[
+   {"library":"playwright","keyword":"goto","args":["https://example.com"]},
+   {"library":"playwright","keyword":"screenshot","args":["x"]}],
+   "expected_result":"loaded","traceability_to_requirement":"smoke"}},
+ "target_url":"https://example.com","timeout_seconds":300,
+ "allowed_urls":["https://example.com/*"]}
+JSON
+)" | jq -r .run_id
+  }
+  local fill tgt
+  fill=$(_post_run "$TA" filler) || return 1
+  [[ -n "$fill" && "$fill" != "null" ]] || { echo "filler submit failed: rid='$fill'"; return 1; }
+  tgt=$(_post_run "$TA" target) || return 1
+  [[ -n "$tgt" && "$tgt" != "null" ]] || { echo "target submit failed: rid='$tgt'"; return 1; }
+  local st
+  st=$(curl -fsS "http://localhost:8004/runs/$tgt" | jq -r .status)
+  [[ "$st" == "queued" ]] || { echo "target not queued, status=$st"; return 1; }
+  local code
+  code=$(curl -s -o /tmp/cancel_xt.out -w '%{http_code}' \
+    -X POST "http://localhost:8004/runs/$tgt/cancel" \
+    -H 'Content-Type: application/json' \
+    -d "{\"actor_urn\":\"urn:qa-aqa:user:b\",\"tenant_id\":\"$TB\"}")
+  [[ "$code" == "403" ]] || { echo "expected 403 cross-tenant, got $code body=$(cat /tmp/cancel_xt.out)"; return 1; }
+  # Cleanup: cancel target as the owning tenant so its slot frees.
+  curl -s -X POST "http://localhost:8004/runs/$tgt/cancel" \
+    -H 'Content-Type: application/json' \
+    -d "{\"actor_urn\":\"urn:qa-aqa:user:a\",\"tenant_id\":\"$TA\"}" > /dev/null
+}
+
+smoke_runner_cancel_already_terminal() {
+  # Submit a real playwright run and wait for it to terminate cleanly. Then
+  # cancel -> 409 (terminal). The plan's original "steps:[]" payload is
+  # unreliable: with no steps the executor may error out (failed) or complete
+  # instantly, races against the poll loop. Using goto+screenshot mirrors the
+  # payload other smokes rely on.
+  local TENANT="smk-term-$RANDOM"
+  local rid
+  rid=$(curl -fsS -X POST http://localhost:8004/runs -H 'Content-Type: application/json' -d "$(cat <<JSON
+{"tenant_id":"$TENANT","workflow_id":"smoke:cancel-term","test_case_id":"term",
+ "test_case":{"payload":{"title":"term","steps":[
+   {"library":"playwright","keyword":"goto","args":["https://example.com"]},
+   {"library":"playwright","keyword":"screenshot","args":["x"]}],
+   "expected_result":"loaded","traceability_to_requirement":"smoke"}},
+ "target_url":"https://example.com","timeout_seconds":120,
+ "allowed_urls":["https://example.com/*"]}
+JSON
+)" | jq -r .run_id) || return 1
+  [[ -n "$rid" && "$rid" != "null" ]] || { echo "submit failed: rid='$rid'"; return 1; }
+  local status="" i
+  for i in $(seq 1 120); do
+    status=$(curl -fsS "http://localhost:8004/runs/$rid" | jq -r .status)
+    [[ "$status" == "completed" || "$status" == "failed" ]] && break
+    sleep 1
+  done
+  [[ "$status" == "completed" || "$status" == "failed" ]] || { echo "run did not terminate in 120s, last status=$status"; return 1; }
+  local code
+  code=$(curl -s -o /tmp/cancel_term.out -w '%{http_code}' \
+    -X POST "http://localhost:8004/runs/$rid/cancel" \
+    -H 'Content-Type: application/json' \
+    -d "{\"actor_urn\":\"urn:qa-aqa:user:smoke\",\"tenant_id\":\"$TENANT\"}")
+  [[ "$code" == "409" ]] || { echo "expected 409, got $code body=$(cat /tmp/cancel_term.out)"; return 1; }
+}
+
 smoke_bff_quota_in_me() {
     # BFF /api/me includes quota.concurrent + quota.daily for the caller's tenant.
     local base="http://localhost:${PORT_APISIX_PROXY}/api"
@@ -1772,6 +1848,8 @@ smoke_tests() {
         "runner-quota-concurrent|smoke_runner_d1_4_quota_concurrent"
         "bff-quota-in-me|smoke_bff_quota_in_me"
         "runner-cancel-queued|smoke_runner_cancel_queued"
+        "runner-cancel-cross-tenant|smoke_runner_cancel_cross_tenant"
+        "runner-cancel-already-terminal|smoke_runner_cancel_already_terminal"
     )
     for t in "${tests[@]}"; do
         local name="${t%%|*}"

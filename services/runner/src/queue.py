@@ -476,17 +476,39 @@ class Queue:
         out.sort(key=lambda r: r.get("submitted_at") or "", reverse=True)
         return out
 
-    async def recover_orphans(self) -> int:
-        """On startup, mark any in-flight runs as failed. Returns count recovered."""
+    async def recover_orphans(self, on_canceled_cleanup=None) -> dict[str, int]:
+        """On startup, reconcile in-flight runs.
+
+        If `cancel_requested=1` was observed before the crash: route to
+        mark_canceled and invoke `on_canceled_cleanup(container_name)` if
+        provided (to remove the straggler container). Otherwise: mark_failed
+        with a "runner restarted mid-run" note.
+
+        Returns {'canceled': N, 'failed': M}.
+        """
         assert self._v is not None
         ids: list[str] = await self._v.lrange(K_PROCESSING, 0, -1)
-        n = 0
+        canceled = 0
+        failed = 0
         for run_id in ids:
             state = await self._v.hgetall(k_run(run_id))
+            if not state:
+                await self._v.lrem(K_PROCESSING, 0, run_id)
+                continue
             tenant_id = state.get("tenant_id", "default")
-            await self.mark_failed(run_id, tenant_id, "runner restarted mid-run")
-            n += 1
-        return n
+            if state.get("cancel_requested") == "1":
+                await self.mark_canceled(run_id, tenant_id)
+                cname = state.get("container_name", "")
+                if cname and on_canceled_cleanup is not None:
+                    try:
+                        await on_canceled_cleanup(cname)
+                    except Exception:  # noqa: BLE001
+                        pass
+                canceled += 1
+            else:
+                await self.mark_failed(run_id, tenant_id, "runner restarted mid-run")
+                failed += 1
+        return {"canceled": canceled, "failed": failed}
 
     async def quota_status(self, tenant_id: str) -> dict[str, Any]:
         """Live quota counters for the BFF /api/me payload."""

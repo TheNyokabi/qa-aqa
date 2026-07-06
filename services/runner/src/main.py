@@ -44,9 +44,10 @@ async def _startup() -> None:
     if n:
         log.info("reaped %d orphan sandbox container(s) from prior runs", n)
     await _q.connect()
-    recovered = await _q.recover_orphans()
-    if recovered:
-        log.info("recovered %d orphan run(s) from prior crash", recovered)
+    recovered = await _q.recover_orphans(on_canceled_cleanup=_podman_rm_force)
+    if recovered.get("canceled") or recovered.get("failed"):
+        log.info("recovered orphans: canceled=%d failed=%d",
+                 recovered["canceled"], recovered["failed"])
     global _worker_task
     _worker_task = asyncio.create_task(_worker_loop())
     log.info("worker loop started; quota concurrent=%d daily=%d",
@@ -194,6 +195,15 @@ async def _worker_loop() -> None:
         if not run_id:
             continue
         await _execute_run(run_id)
+
+
+async def _podman_rm_force(container_name: str) -> None:
+    """Best-effort container removal for orphan cleanup. Ignores all errors
+    (already-gone, not-found, etc.) — the goal is 'gone' regardless of prior state."""
+    try:
+        await sandbox_executor._podman("rm", "-f", container_name, timeout=5.0)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _sandbox_kill(container_name: str) -> tuple[bool, str]:

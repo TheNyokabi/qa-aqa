@@ -1551,6 +1551,60 @@ JSON
   [[ "$in_set" == "0" ]] || { echo "tenant:running still contains $target"; return 1; }
 }
 
+smoke_runner_cancel_running() {
+  # End-to-end cancel of a running sandbox. Uses a `wait_for` step targeting a
+  # selector that will never appear, which pins the sandbox in playwright's
+  # default 30s wait_for_selector timeout — long enough to observe status=
+  # running, issue cancel, and let the worker's watcher/podman kill converge
+  # on status=canceled. The plan's original `steps:[]` payload finished too
+  # fast to reliably reach running before we could cancel.
+  local TENANT="smk-cancel-r-$RANDOM"
+  local body
+  body=$(cat <<JSON
+{"tenant_id":"$TENANT","workflow_id":"smoke:cancel-r","test_case_id":"cancel-r",
+ "test_case":{"payload":{"title":"cancel-running","steps":[
+   {"library":"playwright","keyword":"goto","args":["https://example.com"]},
+   {"library":"playwright","keyword":"wait_for","args":["#never-appears-selector-$RANDOM"]}],
+   "expected_result":"never","traceability_to_requirement":"smoke"}},
+ "target_url":"https://example.com","timeout_seconds":120,
+ "allowed_urls":["https://example.com/*"]}
+JSON
+)
+  local rid
+  rid=$(curl -fsS -X POST http://localhost:8004/runs -H 'Content-Type: application/json' -d "$body" | jq -r .run_id) || return 1
+  [[ -n "$rid" && "$rid" != "null" ]] || { echo "submit failed: rid='$rid'"; return 1; }
+  # Wait up to 30s for status=running.
+  local status="" i
+  for i in $(seq 1 30); do
+    status=$(curl -fsS "http://localhost:8004/runs/$rid" | jq -r .status)
+    [[ "$status" == "running" ]] && break
+    sleep 1
+  done
+  [[ "$status" == "running" ]] || { echo "run never reached running: $status"; return 1; }
+  # Container name recorded by the worker before podman run.
+  local cname
+  cname=$(podman exec valkey valkey-cli HGET "run:$rid" container_name)
+  [[ -n "$cname" ]] || { echo "container_name not recorded"; return 1; }
+  # Issue cancel.
+  local code
+  code=$(curl -s -o /tmp/cancel_r.out -w '%{http_code}' \
+    -X POST "http://localhost:8004/runs/$rid/cancel" \
+    -H 'Content-Type: application/json' \
+    -d "{\"actor_urn\":\"urn:qa-aqa:user:smoke\",\"tenant_id\":\"$TENANT\"}")
+  [[ "$code" == "200" ]] || { echo "cancel returned $code body=$(cat /tmp/cancel_r.out)"; return 1; }
+  # Within 15s (kill + container exit + worker mark_completed / mark_failed reroute).
+  for i in $(seq 1 15); do
+    status=$(curl -fsS "http://localhost:8004/runs/$rid" | jq -r .status)
+    [[ "$status" == "canceled" ]] && break
+    sleep 1
+  done
+  [[ "$status" == "canceled" ]] || { echo "expected canceled within 15s, got $status"; return 1; }
+  # tenant:running must NOT contain the canceled run (slot released).
+  local in_set
+  in_set=$(podman exec valkey valkey-cli SISMEMBER "tenant:$TENANT:running" "$rid")
+  [[ "$in_set" == "0" ]] || { echo "tenant:running still contains $rid"; return 1; }
+}
+
 smoke_runner_list_active() {
   # Submit 2 long-running playwright runs as tenant A. GET /runs?active=true
   # for tenant A must return both; for tenant B must return zero. Cleanup:
@@ -1895,6 +1949,7 @@ smoke_tests() {
         "runner-cancel-cross-tenant|smoke_runner_cancel_cross_tenant"
         "runner-cancel-already-terminal|smoke_runner_cancel_already_terminal"
         "runner-list-active|smoke_runner_list_active"
+        "runner-cancel-running|smoke_runner_cancel_running"
     )
     for t in "${tests[@]}"; do
         local name="${t%%|*}"

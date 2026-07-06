@@ -147,11 +147,32 @@ async def cancel_run(run_id: str, body: CancelRequest) -> dict[str, Any]:
             raise HTTPException(status_code=409,
                                 detail={"detail": "run already terminal", "status": r.previous_status})
         return {"run_id": run_id, "status": "canceled", "previous_status": r.previous_status}
+    if current_status == "running":
+        r, container_name = await _q.cancel_running(run_id, body.actor_urn, body.tenant_id)
+        if r.code == 3:
+            raise HTTPException(status_code=404, detail="run not found")
+        if r.code == 1:
+            raise HTTPException(status_code=403, detail="cross-tenant cancel forbidden")
+        if r.code == 2:
+            raise HTTPException(status_code=409,
+                                detail={"detail": "run already terminal", "status": r.previous_status})
+        # cancel_requested is set; issue podman kill directly. The worker's watcher
+        # will also kill on its next poll (~2s) — belt and braces.
+        if container_name:
+            ok, msg = await _sandbox_kill(container_name)
+            if not ok:
+                # Leave cancel_requested set; worker's mark_completed Lua will
+                # still reroute the terminal status to canceled when the sandbox
+                # eventually exits (natural completion or forced by hung-container
+                # timeout).
+                raise HTTPException(status_code=502,
+                                    detail={"detail": "kill failed", "error": msg})
+        return {"run_id": run_id, "status": "canceled", "previous_status": "running"}
     if current_status in ("completed", "failed", "canceled"):
         raise HTTPException(status_code=409,
                             detail={"detail": "run already terminal", "status": current_status})
-    # current_status == "running" — implemented in Task 5
-    raise HTTPException(status_code=501, detail="running-cancel not yet implemented")
+    raise HTTPException(status_code=500,
+                        detail={"detail": "unexpected status", "status": current_status})
 
 
 # ── worker loop ──────────────────────────────────────────────────────────────
@@ -175,6 +196,37 @@ async def _worker_loop() -> None:
         await _execute_run(run_id)
 
 
+async def _sandbox_kill(container_name: str) -> tuple[bool, str]:
+    """Kill a sandbox container by name via podman CLI. 0 or 'no such container'
+    are both treated as success — the goal is 'this container is not running'."""
+    rc, _out, err = await sandbox_executor._podman("kill", container_name, timeout=5.0)
+    if rc == 0:
+        return True, "killed"
+    text = err.decode(errors="replace")
+    if "no such container" in text.lower() or "not running" in text.lower():
+        return True, f"already gone (rc={rc})"
+    return False, f"podman kill rc={rc}: {text[:200]}"
+
+
+async def _watch_for_cancel(
+    run_id: str, container_name: str, sandbox_task: asyncio.Task
+) -> None:
+    """Poll cancel_requested every 2s while the sandbox runs; kill on observation."""
+    try:
+        while not sandbox_task.done():
+            await asyncio.sleep(2)
+            if sandbox_task.done():
+                return
+            if await _q.is_cancel_requested(run_id):
+                log.info("worker: cancel observed for %s; killing %s",
+                         run_id, container_name)
+                ok, msg = await _sandbox_kill(container_name)
+                log.info("worker: %s watcher podman_kill: %s", run_id, msg)
+                return
+    except asyncio.CancelledError:
+        return
+
+
 async def _execute_run(run_id: str) -> None:
     state = await _q.get(run_id)
     if not state:
@@ -182,13 +234,29 @@ async def _execute_run(run_id: str) -> None:
         return
     tenant_id = state.get("tenant_id", "default")
     req = state.get("request") or {}
-    try:
-        await _q.mark_running(run_id)
-        sandbox_id = uuid.uuid4().hex[:12]
-        result = await sandbox_executor.run_sandbox(
+
+    # start_or_abort: if a cancel arrived between claim_next and here, bail
+    # without spawning a sandbox. Lua already routed the run to canceled.
+    decision = await _q.start_or_abort(run_id)
+    if decision == "abort":
+        log.info("worker: %s aborted before start (canceled while queued)", run_id)
+        return
+
+    # Deterministic container name. sandbox_executor names its container
+    # qa-aqa-sandbox-{sandbox_id}; we pass run_id[:12] as sandbox_id so the
+    # cancel handler can compute the same name without a lookup race.
+    sandbox_id = run_id[:12]
+    container_name = f"{sandbox_executor.CONTAINER_NAME_PREFIX}{sandbox_id}"
+    await _q.set_container_name(run_id, container_name)
+    # Clear any stale container of the same name (recovery-after-crash path).
+    await sandbox_executor._podman("rm", "-f", container_name, timeout=5.0)
+
+    timeout_s = req.get("timeout_seconds", DEFAULT_TIMEOUT)
+    sandbox_task: asyncio.Task = asyncio.create_task(
+        sandbox_executor.run_sandbox(
             test_case=req["test_case"],
             target_url=req.get("target_url"),
-            timeout_seconds=req.get("timeout_seconds", DEFAULT_TIMEOUT),
+            timeout_seconds=timeout_s,
             tenant_id=tenant_id,
             workflow_id=req.get("workflow_id", ""),
             test_case_id=req.get("test_case_id", "unknown"),
@@ -196,8 +264,28 @@ async def _execute_run(run_id: str) -> None:
             bucket=BUCKET,
             allowed_urls=req.get("allowed_urls", []),
         )
-        await _q.mark_completed(run_id, tenant_id, result)
-        log.info("worker: %s completed (status=%s)", run_id, result.get("status", "?"))
+    )
+    watcher = asyncio.create_task(_watch_for_cancel(run_id, container_name, sandbox_task))
+
+    try:
+        # Hung-container guard: sandbox has already got its own overall_timeout
+        # inside run_sandbox; this outer wait_for gives an extra 60s grace before
+        # we force-cancel (spec §5.6).
+        result = await asyncio.wait_for(sandbox_task, timeout=timeout_s + 60)
+        final = await _q.mark_completed(run_id, tenant_id, result)
+        log.info("worker: %s -> %s (result_status=%s)",
+                 run_id, final, result.get("status", "?"))
+    except asyncio.TimeoutError:
+        log.error("worker: %s hung past %ds; force-canceling", run_id, timeout_s + 60)
+        await _sandbox_kill(container_name)
+        await _q.mark_canceled(run_id, tenant_id)
     except Exception as e:  # noqa: BLE001
         log.exception("worker: %s failed", run_id)
-        await _q.mark_failed(run_id, tenant_id, f"{type(e).__name__}: {e}")
+        final = await _q.mark_failed(run_id, tenant_id, f"{type(e).__name__}: {e}")
+        log.info("worker: %s -> %s (from failure)", run_id, final)
+    finally:
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass

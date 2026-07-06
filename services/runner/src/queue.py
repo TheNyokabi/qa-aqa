@@ -178,6 +178,39 @@ return {'running'}
 """
 
 
+# Atomic cancel-running. Tenant-checked. Sets cancel_requested=1 only if
+# status is still 'running'. Returns:
+#   {0, container_name} on success (may be empty if worker hasn't recorded it yet)
+#   {1, stored_tenant}  on cross-tenant (caller -> 403)
+#   {2, current_status} if status is not 'running' (caller -> 409)
+#   {3, ""}             if run hash does not exist (caller -> 404)
+_LUA_CANCEL_RUNNING = """
+local k_run = KEYS[1]
+local run_id = ARGV[1]
+local caller_tenant = ARGV[2]
+local actor_urn = ARGV[3]
+local now = ARGV[4]
+
+if redis.call('EXISTS', k_run) == 0 then
+    return {3, ""}
+end
+local stored_tenant = redis.call('HGET', k_run, 'tenant_id') or ""
+if stored_tenant ~= caller_tenant then
+    return {1, stored_tenant}
+end
+local status = redis.call('HGET', k_run, 'status') or ""
+if status ~= 'running' then
+    return {2, status}
+end
+redis.call('HSET', k_run,
+    'cancel_requested', '1',
+    'canceled_by', actor_urn,
+    'canceled_at', now)
+local cname = redis.call('HGET', k_run, 'container_name') or ""
+return {0, cname}
+"""
+
+
 class QuotaExceeded(Exception):
     def __init__(self, kind: str, current: int, maximum: int):
         self.kind = kind
@@ -202,6 +235,7 @@ class Queue:
         self._mark_terminal_sha: str | None = None
         self._mark_canceled_sha: str | None = None
         self._start_or_abort_sha: str | None = None
+        self._cancel_running_sha: str | None = None
 
     async def connect(self) -> None:
         self._v = Valkey.from_url(self._url, decode_responses=True)
@@ -210,6 +244,7 @@ class Queue:
         self._mark_terminal_sha = await self._v.script_load(_LUA_MARK_TERMINAL)
         self._mark_canceled_sha = await self._v.script_load(_LUA_MARK_CANCELED)
         self._start_or_abort_sha = await self._v.script_load(_LUA_START_OR_ABORT)
+        self._cancel_running_sha = await self._v.script_load(_LUA_CANCEL_RUNNING)
 
     async def close(self) -> None:
         if self._v:
@@ -260,6 +295,33 @@ class Queue:
         if code == 2:
             return CancelResult(2, previous_status=str(result[1]))
         return CancelResult(3)
+
+    async def cancel_running(
+        self, run_id: str, actor_urn: str, caller_tenant: str
+    ) -> tuple[CancelResult, str]:
+        """Set cancel_requested=1 on a running run and return (result, container_name).
+
+        container_name may be '' if the cancel arrived before the worker recorded
+        it; the caller should still treat as success and let the worker observe
+        cancel_requested on its next poll.
+        """
+        assert self._v is not None and self._cancel_running_sha is not None
+        now = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+        result = await self._v.evalsha(
+            self._cancel_running_sha,
+            1,
+            k_run(run_id),
+            run_id, caller_tenant, actor_urn, now,
+        )
+        code = int(result[0])
+        payload = str(result[1])
+        if code == 0:
+            return CancelResult(0, previous_status="running"), payload
+        if code == 1:
+            return CancelResult(1, stored_tenant=payload), ""
+        if code == 2:
+            return CancelResult(2, previous_status=payload), ""
+        return CancelResult(3), ""
 
     async def submit(self, tenant_id: str, request: dict[str, Any]) -> str:
         assert self._v is not None

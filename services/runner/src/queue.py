@@ -110,6 +110,74 @@ return {0, status}
 """
 
 
+# Atomic terminal transition. Reads cancel_requested first; if set, the stored
+# terminal status is 'canceled' regardless of how the container exited (spec
+# §5.4 sandbox-completes-just-as-cancel-arrives). Idempotent: a second call on
+# an already-terminal run no-ops. Returns {final_status}.
+_LUA_MARK_TERMINAL = """
+local k_run = KEYS[1]
+local k_processing = KEYS[2]
+local k_running = KEYS[3]
+local run_id = ARGV[1]
+local intended_status = ARGV[2]
+local now = ARGV[3]
+local result_or_error = ARGV[4]
+local field_name = ARGV[5]
+
+local status = redis.call('HGET', k_run, 'status') or ""
+if status == 'completed' or status == 'failed' or status == 'canceled' then
+    return {status}
+end
+local cancel = redis.call('HGET', k_run, 'cancel_requested')
+local final = intended_status
+if cancel == '1' then
+    final = 'canceled'
+end
+redis.call('HSET', k_run,
+    'status', final,
+    'completed_at', now,
+    field_name, result_or_error)
+redis.call('LREM', k_processing, 0, run_id)
+redis.call('SREM', k_running, run_id)
+return {final}
+"""
+
+
+# Atomic mark-canceled for paths where the run has NOT reached the sandbox
+# (recover_orphans with cancel_requested=1, hung-container timeout, etc.).
+# Idempotent. Returns {final_status}.
+_LUA_MARK_CANCELED = """
+local k_run = KEYS[1]
+local k_processing = KEYS[2]
+local k_running = KEYS[3]
+local run_id = ARGV[1]
+local now = ARGV[2]
+local status = redis.call('HGET', k_run, 'status') or ""
+if status == 'completed' or status == 'failed' or status == 'canceled' then
+    return {status}
+end
+redis.call('HSET', k_run, 'status', 'canceled', 'completed_at', now)
+redis.call('LREM', k_processing, 0, run_id)
+redis.call('SREM', k_running, run_id)
+return {'canceled'}
+"""
+
+
+# Decide whether to start the run or abort because a cancel arrived between
+# claim_next and the worker's first state-write (spec §5.1). Returns {'running'}
+# or {'abort'}.
+_LUA_START_OR_ABORT = """
+local k_run = KEYS[1]
+local now = ARGV[1]
+local status = redis.call('HGET', k_run, 'status') or ""
+if status == 'canceled' then
+    return {'abort'}
+end
+redis.call('HSET', k_run, 'status', 'running', 'started_at', now)
+return {'running'}
+"""
+
+
 class QuotaExceeded(Exception):
     def __init__(self, kind: str, current: int, maximum: int):
         self.kind = kind
@@ -131,11 +199,17 @@ class Queue:
         self._v: Valkey | None = None
         self._reserve_sha: str | None = None
         self._cancel_queued_sha: str | None = None
+        self._mark_terminal_sha: str | None = None
+        self._mark_canceled_sha: str | None = None
+        self._start_or_abort_sha: str | None = None
 
     async def connect(self) -> None:
         self._v = Valkey.from_url(self._url, decode_responses=True)
         self._reserve_sha = await self._v.script_load(_LUA_RESERVE)
         self._cancel_queued_sha = await self._v.script_load(_LUA_CANCEL_QUEUED)
+        self._mark_terminal_sha = await self._v.script_load(_LUA_MARK_TERMINAL)
+        self._mark_canceled_sha = await self._v.script_load(_LUA_MARK_CANCELED)
+        self._start_or_abort_sha = await self._v.script_load(_LUA_START_OR_ABORT)
 
     async def close(self) -> None:
         if self._v:
@@ -214,32 +288,79 @@ class Queue:
         run_id = await self._v.brpoplpush(K_QUEUE, K_PROCESSING, timeout=timeout)
         return run_id
 
-    async def mark_running(self, run_id: str) -> dict[str, Any]:
-        assert self._v is not None
+    async def start_or_abort(self, run_id: str) -> str:
+        """Atomic first state-write after claim_next.
+
+        Returns 'running' (worker should spawn the sandbox) or 'abort' (a cancel
+        arrived between claim_next and here — worker skips to the next item).
+        """
+        assert self._v is not None and self._start_or_abort_sha is not None
         now = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
-        await self._v.hset(k_run(run_id), mapping={"status": "running", "started_at": now})
+        r = await self._v.evalsha(
+            self._start_or_abort_sha,
+            1,
+            k_run(run_id),
+            now,
+        )
+        return str(r[0])
+
+    async def mark_running(self, run_id: str) -> dict[str, Any]:
+        """Legacy method — prefer start_or_abort. Kept so any external callers
+        (tests, tools) don't break. Returns the run HASH after transition."""
+        assert self._v is not None
+        await self.start_or_abort(run_id)
         state = await self._v.hgetall(k_run(run_id))
         return state
 
-    async def mark_completed(self, run_id: str, tenant_id: str, result: dict[str, Any]) -> None:
-        assert self._v is not None
+    async def mark_completed(self, run_id: str, tenant_id: str, result: dict[str, Any]) -> str:
+        """Atomic terminal transition to completed. If cancel_requested=1 was
+        observed, the stored terminal status is 'canceled' instead — returned
+        value reflects what was actually written.
+        """
+        assert self._v is not None and self._mark_terminal_sha is not None
         now = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
-        await self._v.hset(
-            k_run(run_id),
-            mapping={"status": "completed", "completed_at": now, "result": json.dumps(result)},
+        r = await self._v.evalsha(
+            self._mark_terminal_sha,
+            3,
+            k_run(run_id), K_PROCESSING, k_running(tenant_id),
+            run_id, "completed", now, json.dumps(result), "result",
         )
-        await self._v.lrem(K_PROCESSING, 0, run_id)
-        await self.release(tenant_id, run_id)
+        return str(r[0])
 
-    async def mark_failed(self, run_id: str, tenant_id: str, error: str) -> None:
-        assert self._v is not None
+    async def mark_failed(self, run_id: str, tenant_id: str, error: str) -> str:
+        """Atomic terminal transition to failed. Same cancel-reroute semantics
+        as mark_completed."""
+        assert self._v is not None and self._mark_terminal_sha is not None
         now = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
-        await self._v.hset(
-            k_run(run_id),
-            mapping={"status": "failed", "completed_at": now, "error": error},
+        r = await self._v.evalsha(
+            self._mark_terminal_sha,
+            3,
+            k_run(run_id), K_PROCESSING, k_running(tenant_id),
+            run_id, "failed", now, error, "error",
         )
-        await self._v.lrem(K_PROCESSING, 0, run_id)
-        await self.release(tenant_id, run_id)
+        return str(r[0])
+
+    async def mark_canceled(self, run_id: str, tenant_id: str) -> str:
+        """Atomic mark-canceled for paths where no sandbox result exists yet
+        (recovery / hung-container timeout). Idempotent."""
+        assert self._v is not None and self._mark_canceled_sha is not None
+        now = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+        r = await self._v.evalsha(
+            self._mark_canceled_sha,
+            3,
+            k_run(run_id), K_PROCESSING, k_running(tenant_id),
+            run_id, now,
+        )
+        return str(r[0])
+
+    async def set_container_name(self, run_id: str, container_name: str) -> None:
+        assert self._v is not None
+        await self._v.hset(k_run(run_id), "container_name", container_name)
+
+    async def is_cancel_requested(self, run_id: str) -> bool:
+        assert self._v is not None
+        v = await self._v.hget(k_run(run_id), "cancel_requested")
+        return v == "1"
 
     async def get(self, run_id: str) -> dict[str, Any] | None:
         assert self._v is not None

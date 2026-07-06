@@ -103,6 +103,16 @@ async def submit_run(req: RunRequest) -> SubmitResponse:
     return SubmitResponse(run_id=run_id, status="queued")
 
 
+@app.get("/runs")
+async def list_runs(active: bool = False, tenant_id: str = "") -> dict[str, Any]:
+    if not active:
+        raise HTTPException(status_code=400, detail="only active=true is supported")
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+    runs = await _q.list_active(tenant_id)
+    return {"runs": runs}
+
+
 @app.get("/runs/{run_id}")
 async def get_run(run_id: str) -> dict[str, Any]:
     state = await _q.get(run_id)

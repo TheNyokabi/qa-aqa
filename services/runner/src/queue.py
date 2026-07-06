@@ -255,6 +255,44 @@ class Queue:
                     pass
         return out
 
+    async def list_active(self, tenant_id: str) -> list[dict[str, Any]]:
+        """Return queued + running runs for a tenant, sorted by submitted_at desc.
+
+        Bounded by quota maxima (≤ ~150 runs worst case). Scans K_QUEUE plus the
+        tenant's running set; the union deduplicates run_ids that appear in both
+        during the brief BRPOPLPUSH → mark_running window.
+        """
+        assert self._v is not None
+        queued_ids: list[str] = await self._v.lrange(K_QUEUE, 0, -1)
+        running_ids: list[str] = list(await self._v.smembers(k_running(tenant_id)))
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for rid in queued_ids + running_ids:
+            if rid in seen:
+                continue
+            seen.add(rid)
+            h = await self._v.hgetall(k_run(rid))
+            if not h or h.get("tenant_id") != tenant_id:
+                continue
+            status = h.get("status", "")
+            if status not in ("queued", "running"):
+                continue
+            workflow_id = None
+            if h.get("request"):
+                try:
+                    workflow_id = json.loads(h["request"]).get("workflow_id")
+                except Exception:
+                    pass
+            out.append({
+                "run_id": rid,
+                "status": status,
+                "submitted_at": h.get("submitted_at"),
+                "started_at": h.get("started_at"),
+                "workflow_id": workflow_id,
+            })
+        out.sort(key=lambda r: r.get("submitted_at") or "", reverse=True)
+        return out
+
     async def recover_orphans(self) -> int:
         """On startup, mark any in-flight runs as failed. Returns count recovered."""
         assert self._v is not None

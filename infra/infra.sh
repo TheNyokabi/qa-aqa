@@ -1551,6 +1551,50 @@ JSON
   [[ "$in_set" == "0" ]] || { echo "tenant:running still contains $target"; return 1; }
 }
 
+smoke_runner_list_active() {
+  # Submit 2 long-running playwright runs as tenant A. GET /runs?active=true
+  # for tenant A must return both; for tenant B must return zero. Cleanup:
+  # cancel both runs so their slots free before the next test.
+  local TA="smk-list-A-$RANDOM"
+  local TB="smk-list-B-$RANDOM"
+  local _post_run
+  _post_run() {
+    local role="$1"
+    curl -fsS -X POST http://localhost:8004/runs -H 'Content-Type: application/json' -d "$(cat <<JSON
+{"tenant_id":"$TA","workflow_id":"smoke:list-active","test_case_id":"$role",
+ "test_case":{"payload":{"title":"$role","steps":[
+   {"library":"playwright","keyword":"goto","args":["https://example.com"]},
+   {"library":"playwright","keyword":"screenshot","args":["x"]}],
+   "expected_result":"loaded","traceability_to_requirement":"smoke"}},
+ "target_url":"https://example.com","timeout_seconds":300,
+ "allowed_urls":["https://example.com/*"]}
+JSON
+)" | jq -r .run_id
+  }
+  local id1 id2
+  id1=$(_post_run r1) || return 1
+  [[ -n "$id1" && "$id1" != "null" ]] || { echo "r1 submit failed: rid='$id1'"; return 1; }
+  id2=$(_post_run r2) || return 1
+  [[ -n "$id2" && "$id2" != "null" ]] || { echo "r2 submit failed: rid='$id2'"; return 1; }
+  local body_a body_b
+  body_a=$(curl -fsS "http://localhost:8004/runs?active=true&tenant_id=$TA")
+  body_b=$(curl -fsS "http://localhost:8004/runs?active=true&tenant_id=$TB")
+  local count_a count_b
+  count_a=$(echo "$body_a" | jq '.runs | length')
+  count_b=$(echo "$body_b" | jq '.runs | length')
+  [[ "$count_a" == "2" ]] || { echo "tenant A: expected 2 active, got $count_a body=$body_a"; return 1; }
+  [[ "$count_b" == "0" ]] || { echo "tenant B: expected 0 active, got $count_b body=$body_b"; return 1; }
+  # Each returned run must carry status queued|running and belong to tenant A.
+  echo "$body_a" | jq -e '.runs | all(.status == "queued" or .status == "running")' >/dev/null \
+    || { echo "tenant A runs not all queued/running: $body_a"; return 1; }
+  # Cleanup: cancel both to release quota slots.
+  for rid in "$id1" "$id2"; do
+    curl -s -X POST "http://localhost:8004/runs/$rid/cancel" \
+      -H 'Content-Type: application/json' \
+      -d "{\"actor_urn\":\"urn:qa-aqa:user:smoke\",\"tenant_id\":\"$TA\"}" > /dev/null
+  done
+}
+
 smoke_runner_cancel_cross_tenant() {
   # Tenant A holds a long-running filler that occupies the worker; tenant A
   # submits a target that queues behind the filler; tenant B attempts to cancel
@@ -1850,6 +1894,7 @@ smoke_tests() {
         "runner-cancel-queued|smoke_runner_cancel_queued"
         "runner-cancel-cross-tenant|smoke_runner_cancel_cross_tenant"
         "runner-cancel-already-terminal|smoke_runner_cancel_already_terminal"
+        "runner-list-active|smoke_runner_list_active"
     )
     for t in "${tests[@]}"; do
         local name="${t%%|*}"

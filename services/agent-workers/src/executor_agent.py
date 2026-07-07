@@ -209,7 +209,19 @@ async def run_in_sandbox(
         s.raise_for_status()
         state = s.json()
         status = state.get("status")
-        if status in ("completed", "failed"):
+        if status in ("completed", "failed", "canceled"):
+            if status == "canceled":
+                return {
+                    "mode": "playwright_sandbox",
+                    "status": "canceled",
+                    "error_message": f"canceled by {state.get('canceled_by', 'unknown')}",
+                    "screenshots": [],
+                    "videos": [],
+                    "console_log_url": "",
+                    "duration_ms": 0,
+                    "canceled_at": state.get("canceled_at"),
+                    "run_id": run_id,
+                }
             result = state.get("result") or {}
             if status == "failed" and not result:
                 return {

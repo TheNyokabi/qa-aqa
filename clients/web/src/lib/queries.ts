@@ -174,3 +174,37 @@ export function useWorkflowStatus(id: string | undefined) {
     },
   });
 }
+
+// D1.4.1 — Active runs + cancel
+export type RunSummary = {
+  run_id: string;
+  status: "queued" | "running" | "canceled" | "completed" | "failed";
+  submitted_at: string | null;
+  started_at: string | null;
+  workflow_id: string | null;
+};
+
+export function useActiveRuns() {
+  return useQuery({
+    queryKey: ["active-runs"],
+    queryFn: () => api<{ runs: RunSummary[] }>("/api/runs?active=true"),
+    refetchInterval: 3_000,
+  });
+}
+
+export function useCancelRun() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (runId: string) =>
+      api<{ run_id: string; status: string; previous_status: string }>(
+        `/api/runs/${encodeURIComponent(runId)}/cancel`,
+        { method: "POST" }
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["active-runs"] });
+      qc.invalidateQueries({ queryKey: ["me-quota"] });
+      qc.invalidateQueries({ queryKey: ["workflow"] });
+      qc.invalidateQueries({ queryKey: ["wf-status"] });
+    },
+  });
+}

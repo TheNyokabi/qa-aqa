@@ -1551,6 +1551,61 @@ JSON
   [[ "$in_set" == "0" ]] || { echo "tenant:running still contains $target"; return 1; }
 }
 
+smoke_bff_cancel_passthrough() {
+  # End-to-end cancel via BFF. Login as reviewer, submit a filler + target to
+  # the runner directly (BFF doesn't expose submit), then cancel the queued
+  # target using BFF JWT auth (which injects actor_urn + tenant_id server-side).
+  # Also verifies the BFF list_active passthrough.
+  local base="http://localhost:${PORT_APISIX_PROXY}/api"
+  local login
+  login=$(curl -fsS -X POST -H 'Content-Type: application/json' "${base}/auth/login" \
+    -d '{"email":"reviewer@qa-aqa.local","password":"reviewer123"}') || return 1
+  local token; token=$(echo "$login" | jq -r .access_token)
+  [[ -n "$token" && "$token" != "null" ]] || { echo "no token: $login"; return 1; }
+  # Reviewer's tenant is "default"; submit directly to runner in that tenant.
+  local _post_run
+  _post_run() {
+    local role="$1"
+    curl -fsS -X POST http://localhost:8004/runs -H 'Content-Type: application/json' -d "$(cat <<JSON
+{"tenant_id":"default","workflow_id":"smoke:bff-cancel","test_case_id":"$role",
+ "test_case":{"payload":{"title":"$role","steps":[
+   {"library":"playwright","keyword":"goto","args":["https://example.com"]},
+   {"library":"playwright","keyword":"screenshot","args":["x"]}],
+   "expected_result":"loaded","traceability_to_requirement":"smoke"}},
+ "target_url":"https://example.com","timeout_seconds":300,
+ "allowed_urls":["https://example.com/*"]}
+JSON
+)" | jq -r .run_id
+  }
+  local fill target
+  fill=$(_post_run filler) || return 1
+  [[ -n "$fill" && "$fill" != "null" ]] || { echo "filler submit failed: rid='$fill'"; return 1; }
+  target=$(_post_run target) || return 1
+  [[ -n "$target" && "$target" != "null" ]] || { echo "target submit failed: rid='$target'"; return 1; }
+  # Target should be queued behind the filler.
+  local tst
+  tst=$(curl -fsS "http://localhost:8004/runs/$target" | jq -r .status)
+  [[ "$tst" == "queued" ]] || { echo "target not queued, status=$tst"; return 1; }
+  # Cancel via BFF (JWT-only; no tenant_id/actor_urn in body).
+  local code
+  code=$(curl -s -o /tmp/bff_cancel.out -w '%{http_code}' \
+    -X POST "${base}/runs/$target/cancel" \
+    -H "Authorization: Bearer $token")
+  [[ "$code" == "200" ]] || { echo "BFF cancel expected 200, got $code body=$(cat /tmp/bff_cancel.out)"; return 1; }
+  # Cancel must have landed at the runner.
+  local status
+  status=$(curl -fsS "http://localhost:8004/runs/$target" | jq -r .status)
+  [[ "$status" == "canceled" ]] || { echo "expected canceled, got $status"; return 1; }
+  # BFF list_active must work with JWT alone.
+  local body
+  body=$(curl -fsS "${base}/runs?active=true" -H "Authorization: Bearer $token")
+  local count
+  count=$(echo "$body" | jq '.runs | length')
+  [[ "$count" =~ ^[0-9]+$ ]] || { echo "BFF list_active failed: $body"; return 1; }
+  # Cleanup: cancel the filler so its slot frees for other tests.
+  curl -s -X POST "${base}/runs/$fill/cancel" -H "Authorization: Bearer $token" > /dev/null
+}
+
 smoke_runner_cancel_running() {
   # End-to-end cancel of a running sandbox. Uses a `wait_for` step targeting a
   # selector that will never appear, which pins the sandbox in playwright's
@@ -1950,6 +2005,7 @@ smoke_tests() {
         "runner-cancel-already-terminal|smoke_runner_cancel_already_terminal"
         "runner-list-active|smoke_runner_list_active"
         "runner-cancel-running|smoke_runner_cancel_running"
+        "bff-cancel-passthrough|smoke_bff_cancel_passthrough"
     )
     for t in "${tests[@]}"; do
         local name="${t%%|*}"

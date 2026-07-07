@@ -113,6 +113,44 @@ async def me(user: User = Depends(current_user)) -> dict[str, Any]:
     return out
 
 
+@app.get("/api/runs")
+async def list_runs_passthrough(
+    active: bool = False,
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    """Tenant-scoped list of active (queued + running) runs. tenant_id is
+    injected from the caller's JWT so the browser never has to send it."""
+    if not active:
+        raise HTTPException(status_code=400, detail="only active=true is supported")
+    runner_url = os.environ.get("RUNNER_URL", "http://runner-service:8004")
+    async with httpx.AsyncClient(timeout=5.0) as c:
+        r = await c.get(
+            f"{runner_url}/runs",
+            params={"active": "true", "tenant_id": user.tenant_id},
+        )
+    if r.status_code >= 400:
+        detail = r.json().get("detail", r.text) if r.headers.get("content-type", "").startswith("application/json") else r.text
+        raise HTTPException(status_code=r.status_code, detail=detail)
+    return r.json()
+
+
+@app.post("/api/runs/{run_id}/cancel")
+async def cancel_run_passthrough(
+    run_id: str,
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    """Cancel a run. actor_urn + tenant_id are injected from the caller's JWT
+    so the browser never sends them (prevents client-forgery of tenant)."""
+    runner_url = os.environ.get("RUNNER_URL", "http://runner-service:8004")
+    body = {"actor_urn": user.urn, "tenant_id": user.tenant_id}
+    async with httpx.AsyncClient(timeout=10.0) as c:
+        r = await c.post(f"{runner_url}/runs/{run_id}/cancel", json=body)
+    if r.status_code >= 400:
+        detail = r.json().get("detail", r.text) if r.headers.get("content-type", "").startswith("application/json") else r.text
+        raise HTTPException(status_code=r.status_code, detail=detail)
+    return r.json()
+
+
 @app.get("/api/workflows")
 async def list_workflows(
     type: str | None = None,

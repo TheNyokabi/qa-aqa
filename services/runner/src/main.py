@@ -15,10 +15,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import uuid
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel, Field
 
 from . import queue as queue_mod
@@ -29,6 +31,23 @@ log = logging.getLogger("runner-service")
 
 BUCKET = os.environ.get("MINIO_BUCKET", "executions")
 DEFAULT_TIMEOUT = int(os.environ.get("SANDBOX_TIMEOUT_DEFAULT", "120"))
+
+# ── Prometheus metrics ──────────────────────────────────────────────────────
+# End-to-end duration of a successful POST /runs/{id}/cancel from request-in to
+# response-out. Labeled by branch: "queued" is Lua-only (near-instant); "running"
+# includes the podman kill roundtrip. Failed cancels (403/404/409/502) do NOT
+# hit this histogram — they land on the counter below.
+CANCEL_LATENCY = Histogram(
+    "runner_cancel_latency_seconds",
+    "End-to-end duration of a successful cancel request",
+    labelnames=("branch",),
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+)
+CANCEL_REQUESTS = Counter(
+    "runner_cancel_requests_total",
+    "Cancel requests received, by outcome",
+    labelnames=("outcome",),  # ok_queued | ok_running | not_found | cross_tenant | already_terminal | kill_failed | unexpected_status
+)
 
 app = FastAPI(title="runner-service", version="0.2.0")
 _q = queue_mod.Queue()
@@ -87,6 +106,11 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/metrics")
+async def metrics() -> Response:
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.post("/runs", status_code=202, response_model=SubmitResponse)
 async def submit_run(req: RunRequest) -> SubmitResponse:
     try:
@@ -134,8 +158,10 @@ class CancelRequest(BaseModel):
 
 @app.post("/runs/{run_id}/cancel")
 async def cancel_run(run_id: str, body: CancelRequest) -> dict[str, Any]:
+    started = time.monotonic()
     state = await _q.get(run_id)
     if state is None:
+        CANCEL_REQUESTS.labels(outcome="not_found").inc()
         raise HTTPException(status_code=404, detail="run not found")
     # Tenant check FIRST — before dispatching on status. Otherwise the terminal
     # branch's 409 lets a cross-tenant caller distinguish "exists but terminal
@@ -143,25 +169,34 @@ async def cancel_run(run_id: str, body: CancelRequest) -> dict[str, Any]:
     # Lua also tenant-check for defense-in-depth (they never trip now that we
     # check here).
     if state.get("tenant_id", "") != body.tenant_id:
+        CANCEL_REQUESTS.labels(outcome="cross_tenant").inc()
         raise HTTPException(status_code=403, detail="cross-tenant cancel forbidden")
     current_status = state.get("status", "")
     if current_status == "queued":
         r = await _q.cancel_queued(run_id, body.actor_urn, body.tenant_id)
         if r.code == 3:
+            CANCEL_REQUESTS.labels(outcome="not_found").inc()
             raise HTTPException(status_code=404, detail="run not found")
         if r.code == 1:
+            CANCEL_REQUESTS.labels(outcome="cross_tenant").inc()
             raise HTTPException(status_code=403, detail="cross-tenant cancel forbidden")
         if r.code == 2:
+            CANCEL_REQUESTS.labels(outcome="already_terminal").inc()
             raise HTTPException(status_code=409,
                                 detail={"detail": "run already terminal", "status": r.previous_status})
+        CANCEL_LATENCY.labels(branch="queued").observe(time.monotonic() - started)
+        CANCEL_REQUESTS.labels(outcome="ok_queued").inc()
         return {"run_id": run_id, "status": "canceled", "previous_status": r.previous_status}
     if current_status == "running":
         r, container_name = await _q.cancel_running(run_id, body.actor_urn, body.tenant_id)
         if r.code == 3:
+            CANCEL_REQUESTS.labels(outcome="not_found").inc()
             raise HTTPException(status_code=404, detail="run not found")
         if r.code == 1:
+            CANCEL_REQUESTS.labels(outcome="cross_tenant").inc()
             raise HTTPException(status_code=403, detail="cross-tenant cancel forbidden")
         if r.code == 2:
+            CANCEL_REQUESTS.labels(outcome="already_terminal").inc()
             raise HTTPException(status_code=409,
                                 detail={"detail": "run already terminal", "status": r.previous_status})
         # cancel_requested is set; issue podman kill directly. The worker's watcher
@@ -173,12 +208,17 @@ async def cancel_run(run_id: str, body: CancelRequest) -> dict[str, Any]:
                 # still reroute the terminal status to canceled when the sandbox
                 # eventually exits (natural completion or forced by hung-container
                 # timeout).
+                CANCEL_REQUESTS.labels(outcome="kill_failed").inc()
                 raise HTTPException(status_code=502,
                                     detail={"detail": "kill failed", "error": msg})
+        CANCEL_LATENCY.labels(branch="running").observe(time.monotonic() - started)
+        CANCEL_REQUESTS.labels(outcome="ok_running").inc()
         return {"run_id": run_id, "status": "canceled", "previous_status": "running"}
     if current_status in ("completed", "failed", "canceled"):
+        CANCEL_REQUESTS.labels(outcome="already_terminal").inc()
         raise HTTPException(status_code=409,
                             detail={"detail": "run already terminal", "status": current_status})
+    CANCEL_REQUESTS.labels(outcome="unexpected_status").inc()
     raise HTTPException(status_code=500,
                         detail={"detail": "unexpected status", "status": current_status})
 

@@ -288,6 +288,10 @@ scrape_configs:
   - job_name: 'otel-collector'
     static_configs:
       - targets: ['otel-collector:8889']
+  - job_name: 'runner-service'
+    static_configs:
+      - targets: ['runner-service:8004']
+    metrics_path: /metrics
 EOF
     ok "wrote prometheus/prometheus.yml"
 
@@ -1551,6 +1555,38 @@ JSON
   [[ "$in_set" == "0" ]] || { echo "tenant:running still contains $target"; return 1; }
 }
 
+smoke_runner_metrics_exposed() {
+  # runner-service /metrics endpoint exposes the cancel-observability families.
+  # First hit populates the histogram/counter with a real observation so the
+  # HELP/TYPE lines land in the output regardless of scrape order.
+  local TENANT="smk-metrics-$RANDOM"
+  local rid
+  rid=$(curl -fsS -X POST http://localhost:8004/runs -H 'Content-Type: application/json' -d "$(cat <<JSON
+{"tenant_id":"$TENANT","workflow_id":"smoke:metrics","test_case_id":"m",
+ "test_case":{"payload":{"title":"m","steps":[
+   {"library":"playwright","keyword":"goto","args":["https://example.com"]},
+   {"library":"playwright","keyword":"screenshot","args":["x"]}],
+   "expected_result":"loaded","traceability_to_requirement":"smoke"}},
+ "target_url":"https://example.com","timeout_seconds":300,
+ "allowed_urls":["https://example.com/*"]}
+JSON
+)" | jq -r .run_id) || return 1
+  [[ -n "$rid" && "$rid" != "null" ]] || { echo "submit failed: rid='$rid'"; return 1; }
+  # Cancel it (queued path, near-instant, exercises the ok_queued counter +
+  # queued-branch histogram).
+  curl -s -X POST "http://localhost:8004/runs/$rid/cancel" \
+    -H 'Content-Type: application/json' \
+    -d "{\"actor_urn\":\"urn:qa-aqa:user:smoke\",\"tenant_id\":\"$TENANT\"}" > /dev/null
+  # Now /metrics must expose both metric families.
+  local body
+  body=$(curl -fsS http://localhost:8004/metrics) || return 1
+  echo "$body" | grep -qE '^runner_cancel_latency_seconds_' || { echo "missing runner_cancel_latency_seconds_*"; return 1; }
+  echo "$body" | grep -qE '^runner_cancel_requests_total\{' || { echo "missing runner_cancel_requests_total"; return 1; }
+  # ok_queued outcome must have fired at least once from our cancel.
+  echo "$body" | grep -E 'runner_cancel_requests_total\{outcome="ok_queued"\}' | awk '{ if ($NF+0 < 1) exit 1 }' \
+    || { echo "expected ok_queued counter >= 1"; return 1; }
+}
+
 smoke_bff_cancel_passthrough() {
   # End-to-end cancel via BFF. Login as reviewer, submit a filler + target to
   # the runner directly (BFF doesn't expose submit), then cancel the queued
@@ -2040,6 +2076,7 @@ smoke_tests() {
         "runner-cancel-cross-tenant|smoke_runner_cancel_cross_tenant"
         "runner-cancel-already-terminal|smoke_runner_cancel_already_terminal"
         "runner-cancel-cross-tenant-terminal|smoke_runner_cancel_cross_tenant_terminal"
+        "runner-metrics-exposed|smoke_runner_metrics_exposed"
         "runner-list-active|smoke_runner_list_active"
         "runner-cancel-running|smoke_runner_cancel_running"
         "bff-cancel-passthrough|smoke_bff_cancel_passthrough"

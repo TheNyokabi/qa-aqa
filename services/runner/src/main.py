@@ -137,6 +137,13 @@ async def cancel_run(run_id: str, body: CancelRequest) -> dict[str, Any]:
     state = await _q.get(run_id)
     if state is None:
         raise HTTPException(status_code=404, detail="run not found")
+    # Tenant check FIRST — before dispatching on status. Otherwise the terminal
+    # branch's 409 lets a cross-tenant caller distinguish "exists but terminal
+    # in another tenant" from "does not exist". cancel_queued / cancel_running
+    # Lua also tenant-check for defense-in-depth (they never trip now that we
+    # check here).
+    if state.get("tenant_id", "") != body.tenant_id:
+        raise HTTPException(status_code=403, detail="cross-tenant cancel forbidden")
     current_status = state.get("status", "")
     if current_status == "queued":
         r = await _q.cancel_queued(run_id, body.actor_urn, body.tenant_id)

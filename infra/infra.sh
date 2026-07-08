@@ -1746,6 +1746,42 @@ JSON
     -d "{\"actor_urn\":\"urn:qa-aqa:user:a\",\"tenant_id\":\"$TA\"}" > /dev/null
 }
 
+smoke_runner_cancel_cross_tenant_terminal() {
+  # Cross-tenant cancel of a TERMINAL run must return 403, not 409. Prior to
+  # the tenant-check reorder in POST /runs/{id}/cancel, the terminal branch
+  # skipped the tenant check and returned 409, letting a cross-tenant caller
+  # distinguish "exists but terminal" from "does not exist".
+  local TA="smk-xtT-A-$RANDOM"
+  local TB="smk-xtT-B-$RANDOM"
+  local rid
+  rid=$(curl -fsS -X POST http://localhost:8004/runs -H 'Content-Type: application/json' -d "$(cat <<JSON
+{"tenant_id":"$TA","workflow_id":"smoke:cancel-xt-term","test_case_id":"term",
+ "test_case":{"payload":{"title":"term","steps":[
+   {"library":"playwright","keyword":"goto","args":["https://example.com"]},
+   {"library":"playwright","keyword":"screenshot","args":["x"]}],
+   "expected_result":"loaded","traceability_to_requirement":"smoke"}},
+ "target_url":"https://example.com","timeout_seconds":120,
+ "allowed_urls":["https://example.com/*"]}
+JSON
+)" | jq -r .run_id) || return 1
+  [[ -n "$rid" && "$rid" != "null" ]] || { echo "submit failed: rid='$rid'"; return 1; }
+  # Wait for terminal.
+  local status="" i
+  for i in $(seq 1 120); do
+    status=$(curl -fsS "http://localhost:8004/runs/$rid" | jq -r .status)
+    [[ "$status" == "completed" || "$status" == "failed" ]] && break
+    sleep 1
+  done
+  [[ "$status" == "completed" || "$status" == "failed" ]] || { echo "run did not terminate in 120s, last status=$status"; return 1; }
+  # Cross-tenant cancel: must be 403, NOT 409. 409 would leak the run's existence.
+  local code
+  code=$(curl -s -o /tmp/cancel_xt_term.out -w '%{http_code}' \
+    -X POST "http://localhost:8004/runs/$rid/cancel" \
+    -H 'Content-Type: application/json' \
+    -d "{\"actor_urn\":\"urn:qa-aqa:user:b\",\"tenant_id\":\"$TB\"}")
+  [[ "$code" == "403" ]] || { echo "expected 403 for cross-tenant terminal, got $code body=$(cat /tmp/cancel_xt_term.out)"; return 1; }
+}
+
 smoke_runner_cancel_already_terminal() {
   # Submit a real playwright run and wait for it to terminate cleanly. Then
   # cancel -> 409 (terminal). The plan's original "steps:[]" payload is
@@ -2003,6 +2039,7 @@ smoke_tests() {
         "runner-cancel-queued|smoke_runner_cancel_queued"
         "runner-cancel-cross-tenant|smoke_runner_cancel_cross_tenant"
         "runner-cancel-already-terminal|smoke_runner_cancel_already_terminal"
+        "runner-cancel-cross-tenant-terminal|smoke_runner_cancel_cross_tenant_terminal"
         "runner-list-active|smoke_runner_list_active"
         "runner-cancel-running|smoke_runner_cancel_running"
         "bff-cancel-passthrough|smoke_bff_cancel_passthrough"
